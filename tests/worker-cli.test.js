@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { parseWorkerArgs, runWorkerCli } from "../src/core/worker-cli.js";
+import { buildEnqueue, parseWorkerArgs, runWorkerCli } from "../src/core/worker-cli.js";
 import { rpcUrl } from "../src/core/worker-client.js";
 import { isPendingJobWake, realtimeJoinMessage, realtimeWebSocketUrl } from "../src/core/worker-realtime.js";
 import { idlePickupWithinSla, normalizeWorkerSettings, sanitizeLaneSnapshot } from "../src/core/worker-config.js";
@@ -21,6 +21,11 @@ describe("parseWorkerArgs", () => {
       flags: { term: "linen apron" },
     });
     expect(parseWorkerArgs(["results", "--term", "linen apron", "--json"]).flags.json).toBe(true);
+    expect(parseWorkerArgs(["scrape-listings", "--url", "https://www.etsy.com/listing/1234567890", "--url", "https://www.etsy.com/listing/1234567891"])).toMatchObject({
+      command: "scrape-listings",
+      flags: { urls: ["https://www.etsy.com/listing/1234567890", "https://www.etsy.com/listing/1234567891"] },
+    });
+    expect(parseWorkerArgs(["scrape-shop", "--shop", "CoolShop", "--pages", "2", "--visit"]).flags.visit).toBe(true);
   });
 });
 
@@ -105,6 +110,53 @@ describe("runWorkerCli", () => {
     })).toBe(0);
     const parsed = JSON.parse(results.join("\n"));
     expect(parsed.listings[0].listing_id).toBe("1111111111");
+  });
+
+  it("enqueues a listing batch and reads it back by job id", async () => {
+    const seen = [];
+    const fetchImpl = fakeFetch({
+      etsy_worker_enqueue: (body) => {
+        seen.push(body);
+        return { ok: true, id: "job-9", type: body.p_type, action: "inserted", subject: "listings (1)", priority: body.p_priority };
+      },
+      etsy_worker_job_results: (body) => ({
+        ok: true,
+        job: { id: body.p_job_id, type: "scrape-listings", term: "listings (1)", state: "completed", rows: 1 },
+        listings: [],
+        payloads: [{ kind: "listing", body: { listing: { listingId: "1234567890", title: "Mug" } } }],
+      }),
+    });
+    const lines = [];
+    const code = await runWorkerCli(
+      ["scrape-listings", "--url", "https://www.etsy.com/listing/1234567890/nice-mug", "--priority", "3"],
+      env,
+      fetchImpl,
+      { log: (line) => lines.push(line), error: (line) => lines.push(`ERR ${line}`) },
+    );
+    expect(code).toBe(0);
+    expect(seen[0].p_type).toBe("scrape-listings");
+    expect(seen[0].p_params.urls).toEqual(["https://www.etsy.com/listing/1234567890"]);
+    expect(lines[0]).toContain("id=job-9");
+
+    const read = [];
+    const readCode = await runWorkerCli(["results", "--job", "job-9", "--json"], env, fetchImpl, {
+      log: (line) => read.push(line),
+      error: () => {},
+    });
+    expect(readCode).toBe(0);
+    expect(JSON.parse(read.join("\n")).payloads[0].body.listing.title).toBe("Mug");
+  });
+
+  it("rejects a non-etsy listing url before calling the backend", async () => {
+    const code = await runWorkerCli(["scrape-listings", "--url", "https://example.com/listing/1234567890"], env, async () => {
+      throw new Error("should not fetch");
+    }, { log: () => {}, error: () => {} });
+    expect(code).toBe(2);
+    expect(buildEnqueue(parseWorkerArgs(["export", "--source", "shop", "--format", "json", "--chip", "in_carts"])).params).toMatchObject({
+      source: "shop",
+      format: "json",
+      chip: "in_carts",
+    });
   });
 
   it("refuses to run without the backend env and does not echo a key", async () => {

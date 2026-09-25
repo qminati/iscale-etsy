@@ -1,3 +1,5 @@
+import { detectSearchBlock } from "./src/core/search-results.js";
+import { parseShopPage } from "./src/core/shop-page.js";
 import { activateSearchSubmit, formatSearchPathLog, planNextPage, clickPlannedNext, typeAndSubmitSearch } from "./src/core/search-box.js";
 
 // Runs on every Etsy page so a worker lane can type into the search box from
@@ -21,6 +23,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         setTimeout(() => activateSearchSubmit(document), 40);
       }
     });
+    return true;
+  }
+  if (message?.action === "worker.detectBlock") {
+    sendResponse({ block: detectSearchBlock(document) });
+    return true;
+  }
+  if (message?.action === "worker.extractShop") {
+    sendResponse(parseShopPage(document, location.href));
     return true;
   }
   if (message?.action === "worker.clickNext") {

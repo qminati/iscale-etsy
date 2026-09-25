@@ -16,6 +16,11 @@ export const WORKER_RPC = {
   termStatus: "etsy_worker_term_status",
   results: "etsy_worker_results",
   fleetStatus: "etsy_worker_fleet_status",
+  enqueue: "etsy_worker_enqueue",
+  uploadPayload: "etsy_worker_upload_payload",
+  jobStatus: "etsy_worker_job_status",
+  jobResults: "etsy_worker_job_results",
+  lookup: "etsy_worker_lookup",
 };
 
 export function rpcUrl(backendUrl, fn) {
@@ -127,6 +132,31 @@ export function createWorkerClient({ fetchImpl, backendUrl, anonKey } = {}) {
     },
     fleetStatus() {
       return rpc(WORKER_RPC.fleetStatus, {});
+    },
+    enqueue(type, params = {}, priority = 0) {
+      return rpc(WORKER_RPC.enqueue, {
+        p_type: type,
+        p_params: params,
+        p_priority: priority,
+      });
+    },
+    uploadPayload({ jobId, laneName, kind, body, leaseSeconds }) {
+      return rpc(WORKER_RPC.uploadPayload, {
+        p_job_id: jobId,
+        p_lane_name: laneName,
+        p_kind: kind,
+        p_body: body,
+        p_lease_seconds: leaseSeconds,
+      });
+    },
+    jobStatus(jobId) {
+      return rpc(WORKER_RPC.jobStatus, { p_job_id: jobId });
+    },
+    jobResults(jobId, limit = 500, offset = 0) {
+      return rpc(WORKER_RPC.jobResults, { p_job_id: jobId, p_limit: limit, p_offset: offset });
+    },
+    lookup(type, subject) {
+      return rpc(WORKER_RPC.lookup, { p_type: type, p_subject: subject });
     },
   };
 }

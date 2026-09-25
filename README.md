@@ -176,13 +176,15 @@ local state model.
 Worker mode is off unless you turn it on. Local collection, batch jobs, Shop
 View, and CSV export behave the same when it stays off.
 
-When it is on, a headed Chrome window becomes a lane. An agent adds Etsy search
-terms through `scripts/etsy-worker.mjs`. The lane claims the next term, focuses
-Etsy's search box, types the term, and submits the search. If the box is not on
-the page, it opens the search URL instead and logs which path it used. It reads
-Etsy's total result count, uploads that page's listings, then paginates. Rows
-land after the first results page, not at the end of the scan. A captcha or
-block stops the lane and is reported on the job.
+When it is on, a headed Chrome window becomes a lane. An agent queues a
+command (`search`, `scrape-listings`, `scrape-shop`, `export`, or
+`collection-stats`) through `scripts/etsy-worker.mjs`. The lane claims the
+next job and runs it in that visible window. Search still types the term into
+Etsy's search box, reads the total result count, and uploads each page as it
+finishes. Listing and shop jobs use the same window, with the same pause
+between visits, and stop when a captcha appears. Export and collection stats
+read that browser's local data and upload a snapshot. Rows land as each page
+finishes, not only at the end of the job.
 
 Nothing in the extension or the CLI is a backend URL or key. You set those in
 the extension's options and in `ETSY_WORKER_URL` / `ETSY_WORKER_ANON_KEY`.
@@ -195,6 +197,10 @@ npm run worker -- add-terms "linen apron" --priority 10 --pages 2
 npm run worker -- status --term "linen apron"
 npm run worker -- results --term "linen apron" --json
 npm run worker -- search-now "rush term" --pages 1
+npm run worker -- scrape-listings --url "https://www.etsy.com/listing/1234567890"
+npm run worker -- scrape-shop --shop CoolShop --pages 1
+npm run worker -- export --source shop --format csv
+npm run worker -- stats
 ```
 
 Setup, several lanes, health, stuck jobs, and a smoke test are in

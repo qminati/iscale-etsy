@@ -16,7 +16,8 @@ import { authorizeMessageSender } from "./src/core/message-auth.js";
 import { LANE_SESSION_KEY, normalizeWorkerSettings, sanitizeLaneSnapshot, workerAlarmDelayMinutes } from "./src/core/worker-config.js";
 import { createWorkerClient } from "./src/core/worker-client.js";
 import { isEtsySearchForTerm } from "./src/core/search-box.js";
-import { decideWorkerTick, runClaimedSearch } from "./src/core/worker-loop.js";
+import { decideWorkerTick } from "./src/core/worker-loop.js";
+import { runWorkerJob, shapeExport, shapeStats } from "./src/core/worker-commands.js";
 import { isPendingJobWake, parseRealtimeMessage, realtimeHeartbeatMessage, realtimeJoinMessage, realtimeWebSocketUrl } from "./src/core/worker-realtime.js";
 
 const state = {
@@ -1850,7 +1851,7 @@ async function runOneWorkerJob() {
   }
 
   const job = claim.job;
-  const result = await runClaimedSearch({ job, cfg, deps: makeWorkerDeps(client, cfg, job) });
+  const result = await runWorkerJob({ job, cfg, deps: makeWorkerDeps(client, cfg, job) });
   if (result.status === "blocked") {
     await saveSettings({ workerBlockedUntil: Date.now() + cfg.blockBackoffMin * 60000 });
   }
@@ -1866,6 +1867,11 @@ function makeWorkerDeps(client, cfg, job) {
     },
     sleep: delay,
     writeSession: (partial) => writeLaneSession(partial),
+    ensureTab: async () => {
+      tab = await getOrCreateWorkerTab();
+      await showWorkerTab(tab);
+      return tab;
+    },
     openHome: async () => {
       tab = await getOrCreateWorkerTab();
       await showWorkerTab(tab);
@@ -1933,5 +1939,68 @@ function makeWorkerDeps(client, cfg, job) {
     heartbeat: (progress) => client.heartbeat(cfg.laneName, progress.jobId || job.id, progress, cfg.leaseSeconds),
     complete: (progress) => client.completeJob(progress.jobId || job.id, cfg.laneName, progress),
     fail: (info) => client.failJob(info.jobId || job.id, cfg.laneName, info.error, info.blocked === true),
+    detectBlock: async () => {
+      tab = tab || (await getOrCreateWorkerTab());
+      const response = await sendTabMessageRetry(tab.id, { action: "worker.detectBlock" });
+      return response?.block || { blocked: false, reason: null };
+    },
+    extractListing: async (input) => {
+      tab = tab || (await getOrCreateWorkerTab());
+      const response = await sendTabMessageRetry(tab.id, {
+        action: "listing.extract",
+        input: { source: "worker", ...(input || {}) },
+      });
+      if (response?.listing?.found !== false && response?.listing?.id) {
+        try {
+          await saveListing(response.listing);
+        } catch {
+          // the backend payload is the lane's record; the local copy is best-effort
+        }
+      }
+      return response || { error: "extract_failed" };
+    },
+    extractShop: async () => {
+      tab = tab || (await getOrCreateWorkerTab());
+      const response = await sendTabMessageRetry(tab.id, { action: "worker.extractShop" });
+      if (response?.payload) {
+        try {
+          await saveSearchResults(response.payload);
+        } catch {
+          // local search-results capture is best-effort
+        }
+      }
+      return {
+        shop: response?.shop || "",
+        payload: response?.payload || { results: [], totalResults: null },
+        block: response?.block || { blocked: false },
+      };
+    },
+    uploadPayload: (body) => client.uploadPayload({
+      jobId: body.jobId || job.id,
+      laneName: cfg.laneName,
+      kind: body.kind,
+      body: body.body,
+      leaseSeconds: cfg.leaseSeconds,
+    }),
+    buildExport: async (params) => {
+      const source = params?.source || "listings";
+      const rows = source === "search" ? await getAllRecords("search_results") : await getAllRecords("listings");
+      return shapeExport(rows, params);
+    },
+    readStats: async () => {
+      const [tally, searchResults] = await Promise.all([
+        reduceRecords(
+          "listings",
+          (acc, row) => ({
+            total: acc.total + 1,
+            digital: acc.digital + (row.isDigital === true ? 1 : 0),
+            withDemand: acc.withDemand + (row.demandValue > 0 || row.demandText ? 1 : 0),
+          }),
+          { total: 0, digital: 0, withDemand: 0 },
+        ),
+        countRecords("search_results"),
+      ]);
+      return shapeStats({ ...tally, searchResults });
+    },
   };
 }

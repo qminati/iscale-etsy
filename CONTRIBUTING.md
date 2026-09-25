@@ -74,7 +74,9 @@ claim a check passed unless it actually did.
 
 - Keep the extension local-first by default. Optional worker mode must stay
   off until a person enables it, and it must not ship a backend URL, key, or
-  project id.
+  project id. Worker commands run in a visible window, keep a conservative
+  pace, and stop on a captcha. Do not add a remote job that changes settings
+  or deletes the local collection.
 - Do not add accounts, telemetry, or a bundled remote backend.
 - Keep user data local unless the user explicitly exports it or turns on
   worker mode and points it at a backend they control.

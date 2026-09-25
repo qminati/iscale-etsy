@@ -1,8 +1,10 @@
 # Etsy worker runbook
 
-Worker mode lets a chat agent enqueue Etsy searches and read the scraped rows
-back, without anyone clicking inside the extension. The browser stays headed
-and visible. Local-only use is unchanged when worker mode is off.
+Worker mode lets a chat agent run the extension's research commands and read
+the results back, without anyone clicking inside the extension. The queue is a
+command channel: each job has a `type` and params, and one visible lane runs
+it. Local-only use is unchanged when worker mode is off. The browser stays
+headed and visible.
 
 There is no project URL or key in this repository. You create the backend and
 paste its publishable key into the options page and into your shell.
@@ -13,8 +15,12 @@ paste its publishable key into the options page and into your shell.
    (PostgREST plus optional Realtime). Any Postgres that can expose the
    `public.etsy_worker_*` functions over HTTP will also work with the CLI if
    you put a compatible `/rest/v1/rpc` endpoint in `ETSY_WORKER_URL`.
-2. Run [supabase/migrations/20260925120000_etsy_worker.sql](../supabase/migrations/20260925120000_etsy_worker.sql)
-   in the SQL editor or with `psql`. Do not commit the project URL or keys.
+2. Run both migration files, in order, in the SQL editor or with `psql`:
+   [supabase/migrations/20260925120000_etsy_worker.sql](../supabase/migrations/20260925120000_etsy_worker.sql),
+   then [supabase/migrations/20260925140000_etsy_worker_commands.sql](../supabase/migrations/20260925140000_etsy_worker_commands.sql).
+   Do not commit the project URL or keys. The second file is the command
+   channel (`type`, params, and payload snapshots). Search still works if you
+   only applied the first file; the other job types need the second.
 3. If you are on Supabase, the migration adds `etsy_worker.jobs` to the
    `supabase_realtime` publication when that publication exists. That lets an
    idle lane wake as soon as a term is inserted. Polling still picks the term
@@ -49,18 +55,62 @@ not share a scrape.
 
 ## What a lane does
 
-1. Claim the oldest pending job with the highest priority. Claiming sets a
-   lease. A heartbeat and every uploaded page renew it.
-2. Open `https://www.etsy.com/` in the visible tab if needed.
-3. Focus the search box, type the term, and press Search. The service worker
-   console and `chrome.storage.session` key `etsyWorkerLane` record
-   `search path: search_box`. If the box is not there, the lane opens the
-   search URL and logs `search path: url_navigation`.
-4. Read the total result count, scroll the page, and upload that page's rows.
-5. Follow the next-page link (`pagination_click`) or, if it is missing, the
-   search URL for the next page.
-6. Mark the job completed. A captcha or block marks it `blocked` and the lane
-   pauses for the backoff interval instead of starting another search.
+1. Claim the oldest pending job with the highest priority, whatever its type.
+   Claiming sets a lease. A heartbeat and every upload renew it.
+2. Run that type in the visible Etsy tab when the command needs Etsy.
+   `export` and `collection-stats` only read this browser's local collection.
+3. Upload rows as each page or listing finishes, then mark the job completed.
+   A captcha or block marks it `blocked` and the lane pauses for the backoff
+   interval instead of starting another Etsy command.
+
+A `search` job still opens `https://www.etsy.com/`, focuses the search box,
+types the term, and presses Search. The service worker console and
+`chrome.storage.session` key `etsyWorkerLane` record
+`search path: search_box`. If the box is not there, the lane opens the search
+URL and logs `search path: url_navigation`. It reads the total result count,
+uploads that page, then follows the next-page link (`pagination_click`) or
+the search URL.
+
+`scrape-listings` and `scrape-shop` use the same visible tab. Between shop
+pages and between listing visits the lane waits the configured pace (default
+4–9 seconds). A captcha stops the job immediately. Pages already uploaded
+stay readable.
+
+## Feature and job-type map
+
+| Extension feature | Job type | What the lane returns |
+| --- | --- | --- |
+| Search queue and search-results capture (keyword, page, position, price, rating, badges, ads) | `search` | Listing cards plus Etsy's total result count. `add-terms` and `search-now` are this type. |
+| Batch visit of listing URLs (the same listing extract the local Run uses, including demand, reviews, and digital/physical) | `scrape-listings` | One card row per listing, plus a `listing` payload with the full extract. Up to 40 URLs. One open job per set of listing ids. |
+| Etsy shop pages (`etsy.com/shop/Name`) | `scrape-shop` | Listing cards from up to 10 shop pages. `--visit` also opens up to 15 of those listings and uploads full extracts. One open job per shop. |
+| Shop View filter, sort, and demand chips | `export` with `source=shop` | The same query as Shop View (`q`, `demand`, `chip`, `sort`, `dir`), as CSV or JSON. |
+| Dashboard / Shop View CSV export of collected listings | `export` with `source=listings` | CSV or JSON of the local listings store. |
+| Export search CSV | `export` with `source=search` | CSV or JSON of captured search results. |
+| Collection counts (collected, digital, with demand, search-result rows) | `collection-stats` | A small JSON snapshot. No Etsy navigation. |
+
+`export` and `collection-stats` describe the Chrome profile that is running
+the lane, not every previous backend upload. Each export is its own job.
+Results are capped at 500 rows; `truncated` is true when the local store had
+more. Search-results capture also runs as a side effect of `search` and
+`scrape-shop`, into that profile's local store.
+
+## Features left on the machine
+
+These stay local. A queued command cannot do them.
+
+| Feature | Why it is not a job |
+| --- | --- |
+| Popup vs side panel, collapse, live-feed clear, confirm dialogs, badge, version | Presentation only. Clearing the feed does not delete collected rows. |
+| Worker options and other settings | A remote job must not change the backend key, lane name, or pace. |
+| Pause, stop, and resume of the local runner | That would interrupt a person using the same profile. The lane already waits while a local batch is running. |
+| Auto-run interval, randomize, between-terms pause, auto CSV download, clear-after-export, download subfolder | Local runner schedule, not a remote command. |
+| Retry failed, remove URL, remaining URLs | Maintenance for the hidden local runner. |
+| Add to the local term pills | The remote equivalent is a `search` job on the visible lane. |
+| Open Shop View | Opens a local page. The data is `export` with `source=shop`. |
+| Import CSV | The file is on the person's computer. Accepting CSV text from the queue would write untrusted rows into the local store. |
+| Clear collection, clear listings, clear terms | Destructive, and not reversible from the queue. |
+| Image download | Writes a file on the lane machine. It is not a result an agent can read back. |
+| Manual first-review toggle | A preference for passive browsing. `scrape-listings` already uses the full listing extract, including review dates. |
 
 An idle lane checks the queue on the poll interval. Chrome may not wake a
 sleeping extension faster than every 30 seconds. That is still inside the
@@ -76,17 +126,26 @@ export ETSY_WORKER_ANON_KEY="your-publishable-anon-key"
 
 node scripts/etsy-worker.mjs add-terms "linen apron" --priority 10 --pages 2
 node scripts/etsy-worker.mjs search-now "rush term" --pages 1
+node scripts/etsy-worker.mjs scrape-listings --url "https://www.etsy.com/listing/1234567890"
+node scripts/etsy-worker.mjs scrape-shop --shop CoolShop --pages 1
+node scripts/etsy-worker.mjs export --source shop --format csv --q "apron" --chip in_carts
+node scripts/etsy-worker.mjs stats
 node scripts/etsy-worker.mjs status --term "linen apron"
-node scripts/etsy-worker.mjs results --term "linen apron" --json
+node scripts/etsy-worker.mjs status --shop CoolShop
+node scripts/etsy-worker.mjs results --job "<uuid>" --json
 node scripts/etsy-worker.mjs health
 node scripts/etsy-worker.mjs requeue
 ```
 
-`status --term` prints the job state, the lane that claimed it, pages done,
-rows landed, the total result count, and the last error.
+`enqueue --type <type>` accepts the same flags as the matching command.
 
-`results --term --json` prints the rows, including pages already uploaded
-while the job is still `processing`.
+`status --term` prints the type, job state, the lane that claimed it, pages
+done, rows landed, the total result count, and the last error. `status --job`
+and `status --shop` use the same lines. `results --json` prints listing rows
+and any payload snapshots, including pages already uploaded while the job is
+still `processing`. `results --term` is the search shortcut. Listing and
+export jobs are read with `results --job`. Shop jobs also accept
+`results --shop`.
 
 `search-now` inserts the term at a priority above every other open job so the
 next claim takes it. It does not cancel a search a lane is already typing.
@@ -120,7 +179,7 @@ console line is `[etsy-worker] search path: ...`.
 
 This needs a real backend and a visible Chrome window. It is not part of CI.
 
-1. Apply the migration. Start one lane with worker mode enabled and the
+1. Apply both migrations. Start one lane with worker mode enabled and the
    window visible. Confirm `node scripts/etsy-worker.mjs health` lists that
    lane.
 2. Enqueue a small search:
@@ -143,6 +202,18 @@ This needs a real backend and a visible Chrome window. It is not part of CI.
    ```
 
    The next claim should be that term.
+
+6. Optional command-channel checks on the same lane:
+
+   ```bash
+   node scripts/etsy-worker.mjs stats
+   node scripts/etsy-worker.mjs export --source listings --format json
+   node scripts/etsy-worker.mjs scrape-shop --shop SomeShopName --pages 1
+   ```
+
+   `stats` and `export` do not open Etsy. `results --job <id> --json` returns
+   the payload. `scrape-shop` should bring the window forward and stop if a
+   captcha appears (`state: blocked`).
 
 If status stays `pending` past two minutes, check that worker mode is enabled,
 the options save granted host permission, the lane name is set, and the

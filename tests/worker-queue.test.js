@@ -1,11 +1,11 @@
 // @vitest-environment node
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeAll, describe, expect, it } from "vitest";
 
-const sqlPath = join(dirname(fileURLToPath(import.meta.url)), "../supabase/migrations/20260925120000_etsy_worker.sql");
+const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "../supabase/migrations");
 
 let db;
 
@@ -43,7 +43,10 @@ const listing = (id, position, page = 1) => ({
 
 beforeAll(async () => {
   db = new PGlite();
-  await db.exec(readFileSync(sqlPath, "utf8"));
+  const files = readdirSync(migrationsDir).filter((name) => name.endsWith(".sql")).sort();
+  for (const name of files) {
+    await db.exec(readFileSync(join(migrationsDir, name), "utf8"));
+  }
 }, 60000);
 
 describe("etsy worker queue", () => {

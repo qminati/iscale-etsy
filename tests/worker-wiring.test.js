@@ -3,11 +3,14 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { JOB_TYPES } from "../src/core/worker-commands.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const background = readFileSync(join(root, "background.js"), "utf8");
 const manifest = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8"));
 const workerPage = readFileSync(join(root, "worker-page.js"), "utf8");
+const passive = readFileSync(join(root, "passive.js"), "utf8");
+const runbook = readFileSync(join(root, "docs/worker-runbook.md"), "utf8");
 
 describe("worker mode wiring", () => {
   it("opens a visible Etsy tab and polls on its own alarm", () => {
@@ -15,6 +18,11 @@ describe("worker mode wiring", () => {
     expect(background).toContain("if (alarm.name === WORKER_POLL_ALARM) onWorkerAlarm()");
     expect(background).toMatch(/chrome\.tabs\.create\(\{\s*url:\s*"https:\/\/www\.etsy\.com\/",\s*active:\s*true\s*\}\)/);
     expect(background).toContain('action: "worker.typeAndSubmit"');
+    expect(background).toContain("runWorkerJob");
+    expect(background).toContain('action: "worker.detectBlock"');
+    expect(background).toContain('action: "worker.extractShop"');
+    expect(background).toContain('action: "listing.extract"');
+    expect(passive).toContain('startsWith("worker.")');
     expect(background).toContain("chrome.storage.session");
     expect(background).not.toMatch(/puppeteer|playwright|--headless/);
   });
@@ -30,5 +38,14 @@ describe("worker mode wiring", () => {
     expect(manifest.options_ui.page).toBe("options.html");
     expect(workerPage).toContain("typeAndSubmitSearch");
     expect(workerPage).toContain("formatSearchPathLog");
+    expect(workerPage).toContain("worker.detectBlock");
+    expect(workerPage).toContain("parseShopPage");
+  });
+
+  it("documents every job type and the features left local", () => {
+    for (const type of JOB_TYPES) expect(runbook).toContain(`\`${type}\``);
+    expect(runbook).toContain("Features left on the machine");
+    expect(runbook).toContain("Clear collection");
+    expect(runbook).toContain("Import CSV");
   });
 });

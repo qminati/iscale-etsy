@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "iScale Etsy",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Local-first Etsy research scraper v5 with manual collection, batch jobs, Shop View, and CSV export.",
   "permissions": ["alarms", "downloads", "sidePanel", "storage"],
   "optional_host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],

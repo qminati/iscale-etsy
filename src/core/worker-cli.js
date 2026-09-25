@@ -3,8 +3,10 @@
 // Never prints the key.
 
 import { createWorkerClient } from "./worker-client.js";
+import { collectListingUrls, normalizeExportParams } from "./worker-commands.js";
+import { parseShopTarget } from "./shop-page.js";
 
-export const CLI_HELP = `etsy-worker — push Etsy searches to a worker lane and read results
+export const CLI_HELP = `etsy-worker — queue extension commands for a visible worker lane
 
 Environment (required, never commit these):
   ETSY_WORKER_URL        https://YOUR_PROJECT.supabase.co
@@ -13,14 +15,22 @@ Environment (required, never commit these):
 Commands:
   add-terms "<term>" ["<term>" ...] --priority <n> [--pages <n>] [--sort <order>]
   search-now "<term>" [--pages <n>] [--sort <order>]
-  status [--term "<term>"] [--json]
-  results --term "<term>" [--json] [--limit <n>] [--offset <n>]
+  scrape-listings --url <listing-url> [--url <listing-url> ...] [--priority <n>]
+  scrape-shop --shop <name> | --url <shop-url> [--pages <n>] [--visit] [--priority <n>]
+  export --source listings|search|shop --format csv|json [--q <text>] [--chip <chip>] [--sort <key>] [--dir asc|desc]
+  stats
+  enqueue --type <type> [type-specific flags]
+  status [--term "<term>" | --shop <name> | --job <uuid>] [--json]
+  results (--term "<term>" | --shop <name> | --job <uuid>) [--json] [--limit <n>] [--offset <n>]
   health [--json]
   requeue
 
-search-now inserts the term above every other open job so the next claim takes it.
-status --term prints state, lane, pages done, rows landed, total result count, and last error.
-results --json prints the rows an agent can read, including partial pages.
+search stays one open job per term. scrape-shop is one open job per shop.
+scrape-listings is one open job per set of listing ids (40 max).
+export and stats read the lane's local collection and upload a snapshot.
+--visit on scrape-shop also opens up to 15 listing pages.
+status --term prints state, lane, pages done, rows, total result count, and last error.
+results --json prints listings plus any payload snapshots, including partial progress.
 `;
 
 function takeValue(argv, index, flag) {
@@ -47,7 +57,25 @@ export function parseWorkerArgs(argv) {
     else if (token.startsWith("--term=")) flags.term = token.slice("--term=".length);
     else if (token.startsWith("--limit=")) flags.limit = token.slice("--limit=".length);
     else if (token.startsWith("--offset=")) flags.offset = token.slice("--offset=".length);
-    else if (token === "--priority" || token === "--pages" || token === "--sort" || token === "--term" || token === "--limit" || token === "--offset") {
+    else if (token.startsWith("--type=")) flags.type = token.slice("--type=".length);
+    else if (token.startsWith("--shop=")) flags.shop = token.slice("--shop=".length);
+    else if (token.startsWith("--source=")) flags.source = token.slice("--source=".length);
+    else if (token.startsWith("--format=")) flags.format = token.slice("--format=".length);
+    else if (token.startsWith("--q=")) flags.q = token.slice("--q=".length);
+    else if (token.startsWith("--chip=")) flags.chip = token.slice("--chip=".length);
+    else if (token.startsWith("--dir=")) flags.dir = token.slice("--dir=".length);
+    else if (token.startsWith("--demand=")) flags.demand = token.slice("--demand=".length);
+    else if (token.startsWith("--job=")) flags.job = token.slice("--job=".length);
+    else if (token.startsWith("--url=")) {
+      flags.urls = flags.urls || [];
+      flags.urls.push(token.slice("--url=".length));
+    } else if (token === "--visit") flags.visit = true;
+    else if (token === "--url") {
+      const got = takeValue(rest, i, token);
+      flags.urls = flags.urls || [];
+      flags.urls.push(got.value);
+      i = got.index;
+    } else if (token === "--priority" || token === "--pages" || token === "--sort" || token === "--term" || token === "--limit" || token === "--offset" || token === "--type" || token === "--shop" || token === "--source" || token === "--format" || token === "--q" || token === "--chip" || token === "--dir" || token === "--demand" || token === "--job") {
       const got = takeValue(rest, i, token);
       flags[token.slice(2)] = got.value;
       i = got.index;
@@ -82,8 +110,58 @@ function clientFromEnv(env, fetchImpl) {
   return createWorkerClient({ fetchImpl, backendUrl, anonKey });
 }
 
+const ENQUEUE_COMMANDS = new Set(["enqueue", "scrape-listings", "scrape-shop", "export", "stats"]);
+
+export function buildEnqueue(parsed) {
+  const requested = parsed.command === "enqueue" ? String(parsed.flags.type || "").trim() : parsed.command;
+  const type = requested === "stats" ? "collection-stats" : requested;
+  const priority = intFlag(parsed.flags.priority, 0);
+  if (!type) return { error: "usage: enqueue --type <search|scrape-listings|scrape-shop|export|collection-stats>" };
+  if (type === "search") {
+    const terms = termList(parsed);
+    if (terms.length !== 1) return { error: 'usage: enqueue --type search --term "<term>"' };
+    return {
+      type,
+      priority,
+      params: { term: terms[0], pages: intFlag(parsed.flags.pages, 1), sort: parsed.flags.sort || "most_relevant" },
+    };
+  }
+  if (type === "scrape-listings") {
+    const collected = collectListingUrls([...(parsed.flags.urls || []), ...parsed.positionals]);
+    if (collected.error) return { error: collected.error === "too_many_urls" ? "too_many_urls (max 40)" : "invalid_listing_url" };
+    return { type, priority, params: { urls: collected.urls } };
+  }
+  if (type === "scrape-shop") {
+    const raw = parsed.flags.shop || parsed.flags.url || (parsed.flags.urls || [])[0] || parsed.positionals[0];
+    const target = parseShopTarget(raw);
+    if (!target) return { error: "invalid_shop" };
+    const pages = Math.max(1, Math.min(10, intFlag(parsed.flags.pages, target.page || 1)));
+    return {
+      type,
+      priority,
+      params: { shop: target.shop, pages, visitListings: parsed.flags.visit === true },
+    };
+  }
+  if (type === "export") {
+    const params = normalizeExportParams({
+      source: parsed.flags.source,
+      format: parsed.flags.format,
+      q: parsed.flags.q,
+      demand: parsed.flags.demand,
+      chip: parsed.flags.chip,
+      sort: parsed.flags.sort,
+      dir: parsed.flags.dir,
+    });
+    if (params.error) return { error: params.error };
+    return { type, priority, params };
+  }
+  if (type === "collection-stats") return { type, priority, params: {} };
+  return { error: `unknown_job_type: ${type}` };
+}
+
 function printStatus(data, out) {
-  out.log(`term: ${data.term ?? ""}`);
+  out.log(`type: ${data.type ?? "search"}`);
+  out.log(`term: ${data.term ?? data.subject ?? ""}`);
   out.log(`state: ${data.state ?? ""}`);
   out.log(`lane: ${data.lane ?? ""}`);
   out.log(`pages_done: ${data.pages_done ?? 0}`);
@@ -161,31 +239,58 @@ export async function runWorkerCli(argv, env = {}, fetchImpl = globalThis.fetch,
       return 0;
     }
 
+    if (ENQUEUE_COMMANDS.has(parsed.command)) {
+      const request = buildEnqueue(parsed);
+      if (request.error) {
+        out.error(request.error);
+        return 2;
+      }
+      const data = await client.enqueue(request.type, request.params, request.priority);
+      if (data?.ok === false) {
+        out.error(data.error || "enqueue_failed");
+        return 1;
+      }
+      if (parsed.flags.json) printJson(data, out);
+      else out.log(`${data.action}: ${data.type} ${data.subject} priority=${data.priority ?? ""} id=${data.id ?? ""}`);
+      return 0;
+    }
+
     if (parsed.command === "status") {
       const terms = termList(parsed);
-      const data = terms.length
-        ? await client.termStatus(terms[0])
-        : await client.fleetStatus();
+      const data = parsed.flags.job
+        ? await client.jobStatus(parsed.flags.job)
+        : parsed.flags.shop
+          ? await client.lookup("scrape-shop", parsed.flags.shop)
+          : terms.length
+            ? await client.termStatus(terms[0])
+            : await client.fleetStatus();
       if (data?.ok === false) {
         out.error(data.error || "status_failed");
         return 1;
       }
-      if (parsed.flags.json || !terms.length) {
-        if (terms.length && !parsed.flags.json) printStatus(data, out);
-        else printJson(data, out);
-      } else {
-        printStatus(data, out);
-      }
+      if (parsed.flags.json || !(parsed.flags.job || parsed.flags.shop || terms.length)) printJson(data, out);
+      else printStatus(data, out);
       return 0;
     }
 
     if (parsed.command === "results") {
       const terms = termList(parsed);
-      if (terms.length !== 1) {
-        out.error('usage: results --term "<term>" --json');
+      const limit = intFlag(parsed.flags.limit, 500);
+      const offset = intFlag(parsed.flags.offset, 0);
+      let data;
+      if (parsed.flags.job) data = await client.jobResults(parsed.flags.job, limit, offset);
+      else if (parsed.flags.shop) {
+        const found = await client.lookup("scrape-shop", parsed.flags.shop);
+        if (found?.ok === false) {
+          out.error(found.error || "not_found");
+          return 1;
+        }
+        data = await client.jobResults(found.id, limit, offset);
+      } else if (terms.length === 1) data = await client.results(terms[0], limit, offset);
+      else {
+        out.error('usage: results --term "<term>" | --shop <name> | --job <uuid> --json');
         return 2;
       }
-      const data = await client.results(terms[0], intFlag(parsed.flags.limit, 500), intFlag(parsed.flags.offset, 0));
       if (data?.ok === false) {
         out.error(data.error || "results_failed");
         return 1;

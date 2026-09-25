@@ -1,6 +1,6 @@
 {
   "name": "iscale-etsy",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": false,
   "type": "module",
   "description": "Local-first Chrome extension for Etsy research: manual collection, batch jobs, search-result capture, a local Shop View, CSV export, and an optional backend worker lane.",

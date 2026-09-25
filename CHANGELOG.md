@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0 — Worker command channel
+
+- Generalize the optional worker queue into typed jobs: `search`,
+  `scrape-listings`, `scrape-shop`, `export`, and `collection-stats`.
+- A visible lane runs the matching extension feature and uploads status plus
+  results. Listing visits reuse the existing listing extract. Shop jobs read
+  listing cards from the shop page. Export and stats read the lane's local
+  collection and do not open Etsy.
+- Add CLI commands for those types, plus `status` / `results` by job id or
+  shop. The runbook lists every exposed feature and the ones left local.
+- Apply `20260925140000_etsy_worker_commands.sql` after the original worker
+  migration. Worker mode stays off by default.
+
 ## 1.1.0 — Optional backend worker lane
 
 - Add an opt-in worker mode. It is off by default and has no baked-in backend

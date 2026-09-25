@@ -78,7 +78,7 @@
         </div>
         <label for="backoff">Captcha backoff (minutes)</label>
         <input id="backoff" type="number" min="1" max="240" value="30" />
-        <label class="switch"><input id="realtime" type="checkbox" checked /> Wake on new terms (Supabase Realtime, optional)</label>
+        <label class="switch"><input id="realtime" type="checkbox" checked /> Wake on new jobs (Supabase Realtime, optional)</label>
         <p>Default poll is 20 seconds. Chrome may not wake a sleeping extension faster than every 30 seconds, which is still inside the two-minute pickup budget. Realtime is a faster hint when your project publishes <code>etsy_worker.jobs</code>.</p>
         <div class="actions">
           <button class="primary" type="submit">Save</button>
