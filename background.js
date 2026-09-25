@@ -13,6 +13,11 @@ import { mergeSearchResult, searchResultKey, SEARCH_EXPORT_COLUMNS } from "./src
 import { aggregateSession, blankSessionTally, foldSessionUrl } from "./src/core/session.js";
 import { createKeyedQueue } from "./src/core/serialize.js";
 import { authorizeMessageSender } from "./src/core/message-auth.js";
+import { LANE_SESSION_KEY, normalizeWorkerSettings, sanitizeLaneSnapshot, workerAlarmDelayMinutes } from "./src/core/worker-config.js";
+import { createWorkerClient } from "./src/core/worker-client.js";
+import { isEtsySearchForTerm } from "./src/core/search-box.js";
+import { decideWorkerTick, runClaimedSearch } from "./src/core/worker-loop.js";
+import { isPendingJobWake, parseRealtimeMessage, realtimeHeartbeatMessage, realtimeJoinMessage, realtimeWebSocketUrl } from "./src/core/worker-realtime.js";
 
 const state = {
   activeJobId: null,
@@ -27,6 +32,10 @@ const state = {
   loopAlive: false, // true while the runJob loop is actually executing
   launching: false, // true between claiming the runner slot and launchJob setting loopAlive
   cancelledTerms: new Set(), // terms removed mid-run — the runner skips their remaining work
+  workerScanning: false,
+  workerStop: false,
+  workerTabId: null,
+  workerSocket: null,
 };
 
 // Synchronously claim the single runner slot before any `await`. Two async entry
@@ -74,6 +83,14 @@ function saveSettings(value) {
       Object.prototype.hasOwnProperty.call(value, "randomizePct")
     ) {
       await scheduleQueueRun(next);
+    }
+    if (WORKER_SETTING_KEYS.some((key) => Object.prototype.hasOwnProperty.call(value, key))) {
+      // Schedule after this settings write releases the queue. Nested saveSettings
+      // from the worker tab id would deadlock the keyed settings queue.
+      const snapshot = next;
+      setTimeout(() => {
+        ensureWorkerScheduled(snapshot).catch(() => {});
+      }, 0);
     }
     return next;
   });
@@ -136,6 +153,7 @@ async function initFromSettings() {
   // Chrome alarms survive MV3 worker eviction. Preserve an existing countdown
   // instead of resetting it to a full fresh interval on every worker startup.
   await scheduleQueueRun(settings, { preserveExisting: true });
+  await ensureWorkerScheduled(settings);
   // Guarded: if scheduleQueueRun armed the QUEUE_RUN countdown (auto-run on), let THAT
   // advance the run rather than firing an immediate extra scrape on every SW restart.
   // A manual/auto-off interrupted job (no pending alarm) still resumes right away. (HIGH-1)
@@ -291,6 +309,7 @@ async function handleMessage(message, sender) {
   // between runs) still feeds the live feed normally.
   const scrapeActive = state.loopAlive || state.launching;
   const fromRunnerTab = scrapeActive && sender?.tab?.id != null && sender.tab.id === state.tabId;
+  const fromWorkerTab = state.workerScanning && sender?.tab?.id != null && sender.tab.id === state.workerTabId;
 
   if (message.action === "listing.savePassive") {
     if (fromRunnerTab) return { saved: false, skipped: "runner_tab" };
@@ -302,7 +321,7 @@ async function handleMessage(message, sender) {
   }
 
   if (message.action === "search.saveResults") {
-    if (fromRunnerTab) return { saved: 0, skipped: "runner_tab" };
+    if (fromRunnerTab || fromWorkerTab) return { saved: 0, skipped: "runner_tab" };
     return saveSearchResults(message.input?.payload, { captureListings: message.input?.fromManualBrowse === true });
   }
 
@@ -325,6 +344,9 @@ async function handleMessage(message, sender) {
   // (e.g. the Shop View CSV import writes `listings` directly). Without this the badge
   // and the dashboard "X collected" stay stale until the next SW restart, and the next
   // passive save computes its total off a wrong base.
+  if (message.action === "worker.health") return workerHealth();
+  if (message.action === "worker.session") return readLaneSession();
+
   if (message.action === "collection.refresh") {
     await refreshBadge();
     broadcast({ action: "collection.update", total: state.listingCount, withDemand: state.withDemandCount });
@@ -880,6 +902,7 @@ chrome.alarms?.onAlarm.addListener((alarm) => {
   if (alarm.name === JOB_KEEPALIVE_ALARM) guardedResume();
   if (alarm.name === QUEUE_RUN_ALARM) onQueueAlarm();
   if (alarm.name === TERM_GAP_ALARM) onTermGapAlarm();
+  if (alarm.name === WORKER_POLL_ALARM) onWorkerAlarm();
 });
 
 async function onTermGapAlarm() {
@@ -1508,4 +1531,407 @@ function filterListings(listings, filter = {}) {
       String(value || "").toLowerCase().includes(query),
     );
   });
+}
+
+// ---- optional backend worker lane (off unless the options page enables it) ----
+
+const WORKER_POLL_ALARM = "etsy-worker-poll";
+const WORKER_SETTING_KEYS = [
+  "workerEnabled",
+  "workerBackendUrl",
+  "workerAnonKey",
+  "workerLaneName",
+  "workerLeaseSeconds",
+  "workerPollSeconds",
+  "workerHeartbeatSeconds",
+  "workerPaceMinMs",
+  "workerPaceMaxMs",
+  "workerKeystrokeMinMs",
+  "workerKeystrokeMaxMs",
+  "workerBlockBackoffMin",
+  "workerRealtime",
+  "workerBlockedUntil",
+];
+
+function workerConfig(settings) {
+  return normalizeWorkerSettings(settings || {});
+}
+
+async function readLaneSession() {
+  try {
+    const stored = await chrome.storage.session.get(LANE_SESSION_KEY);
+    return stored?.[LANE_SESSION_KEY] || { status: "off" };
+  } catch {
+    return { status: "off" };
+  }
+}
+
+async function writeLaneSession(partial) {
+  try {
+    const prev = await readLaneSession();
+    const next = sanitizeLaneSnapshot({ ...prev, ...partial, updatedAt: new Date().toISOString() });
+    await chrome.storage.session.set({ [LANE_SESSION_KEY]: next });
+    return next;
+  } catch {
+    return null;
+  }
+}
+
+async function workerHealth() {
+  const cfg = workerConfig(await getSettings());
+  if (!cfg.ready) return { ok: false, error: cfg.configError || "worker_not_configured" };
+  const client = createWorkerClient({ fetchImpl: fetch, backendUrl: cfg.backendUrl, anonKey: cfg.anonKey });
+  return client.health();
+}
+
+function closeWorkerRealtime() {
+  if (state.workerSocketTimer) {
+    clearInterval(state.workerSocketTimer);
+    state.workerSocketTimer = null;
+  }
+  try {
+    state.workerSocket?.close();
+  } catch {
+    // already closed
+  }
+  state.workerSocket = null;
+}
+
+function openWorkerRealtime(cfg) {
+  if (!cfg.realtime || !cfg.ready) return;
+  if (state.workerSocket && state.workerSocket.readyState <= 1) return;
+  closeWorkerRealtime();
+  let url;
+  try {
+    url = realtimeWebSocketUrl(cfg.backendUrl, cfg.anonKey);
+  } catch {
+    return;
+  }
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch {
+    return;
+  }
+  state.workerSocket = ws;
+  const ref = { n: 1 };
+  ws.onopen = () => {
+    try {
+      ws.send(JSON.stringify(realtimeJoinMessage(String(ref.n++))));
+    } catch {
+      // polling still wakes the lane
+    }
+  };
+  ws.onmessage = (event) => {
+    const message = parseRealtimeMessage(event.data);
+    if (!isPendingJobWake(message) || state.workerScanning || state.workerStop) return;
+    drainWorkerQueue().catch(() => {});
+  };
+  ws.onerror = () => {};
+  ws.onclose = () => {
+    if (state.workerSocket === ws) state.workerSocket = null;
+  };
+  state.workerSocketTimer = setInterval(() => {
+    if (state.workerSocket !== ws || ws.readyState !== 1) {
+      clearInterval(state.workerSocketTimer);
+      state.workerSocketTimer = null;
+      return;
+    }
+    try {
+      ws.send(JSON.stringify(realtimeHeartbeatMessage(String(ref.n++))));
+    } catch {
+      // ignore
+    }
+  }, 25000);
+}
+
+async function ensureWorkerScheduled(settings) {
+  const cfg = workerConfig(settings);
+  state.workerStop = !cfg.enabled;
+  if (!cfg.enabled) {
+    closeWorkerRealtime();
+    try {
+      await chrome.alarms.clear(WORKER_POLL_ALARM);
+    } catch {
+      // alarms unavailable
+    }
+    try {
+      const existing = await chrome.storage.session.get(LANE_SESSION_KEY);
+      if (existing?.[LANE_SESSION_KEY]) {
+        await writeLaneSession({ status: "off", phase: "disabled", laneName: cfg.laneName, lastError: "" });
+      }
+    } catch {
+      // session storage unused until worker mode has run
+    }
+    return;
+  }
+  try {
+    await chrome.alarms.create(WORKER_POLL_ALARM, { delayInMinutes: workerAlarmDelayMinutes(cfg.pollSeconds) });
+  } catch {
+    // unpacked alarms can still fail in tests that mock chrome poorly
+  }
+  if (cfg.ready && cfg.realtime) openWorkerRealtime(cfg);
+  else closeWorkerRealtime();
+  if (!state.workerScanning) {
+    setTimeout(() => {
+      drainWorkerQueue().catch(() => {});
+    }, 0);
+  }
+}
+
+async function onWorkerAlarm() {
+  if (state.workerScanning || state.workerStop) return;
+  await drainWorkerQueue();
+}
+
+async function showWorkerTab(tab) {
+  // Headed and visible. This lane never opens a background tab or a headless browser.
+  try {
+    await chrome.tabs.update(tab.id, { active: true });
+  } catch {
+    // the tab may have closed between lookup and focus
+  }
+  try {
+    if (tab.windowId != null && chrome.windows?.update) {
+      await chrome.windows.update(tab.windowId, { focused: true, state: "normal" });
+    }
+  } catch {
+    // focusing the window is best-effort; the tab is still the active tab
+  }
+}
+
+function isEtsyPage(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && /(^|\.)etsy\.com$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+async function getOrCreateWorkerTab() {
+  const settings = await getSettings();
+  const candidates = runnerTabCandidates(state.workerTabId, settings.workerTabId).filter((id) => id !== state.tabId);
+  for (const tabId of candidates) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      state.workerTabId = tab.id;
+      if (settings.workerTabId !== tab.id) await saveSettings({ workerTabId: tab.id });
+      await showWorkerTab(tab);
+      return tab;
+    } catch {
+      // closed while the service worker slept
+    }
+  }
+  const tab = await chrome.tabs.create({ url: "https://www.etsy.com/", active: true });
+  state.workerTabId = tab.id;
+  await saveSettings({ workerTabId: tab.id });
+  await showWorkerTab(tab);
+  return tab;
+}
+
+async function sendTabMessageRetry(tabId, message, attempts = 6) {
+  let last = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    last = await sendTabMessage(tabId, message);
+    if (!last?.error) return last;
+    await delay(350);
+  }
+  return last || { error: "no_content_script" };
+}
+
+function waitForTabUrl(tabId, predicate, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    const listener = (id, info, tab) => {
+      if (id !== tabId || info.status !== "complete") return;
+      if (predicate(tab)) finish(tab);
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab?.status === "complete" && predicate(tab)) finish(tab);
+    }).catch(() => {});
+  });
+}
+
+async function drainWorkerQueue() {
+  if (state.workerScanning) return;
+  state.workerScanning = true;
+  try {
+    while (!state.workerStop) {
+      const outcome = await runOneWorkerJob();
+      if (outcome === "completed" || outcome === "failed") continue;
+      break;
+    }
+  } finally {
+    state.workerScanning = false;
+    try {
+      const settings = await getSettings();
+      const cfg = workerConfig(settings);
+      if (cfg.enabled && !state.workerStop) {
+        await chrome.alarms.create(WORKER_POLL_ALARM, { delayInMinutes: workerAlarmDelayMinutes(cfg.pollSeconds) });
+      }
+    } catch {
+      // the next browser start reschedules from settings
+    }
+  }
+}
+
+async function runOneWorkerJob() {
+  const settings = await getSettings();
+  const cfg = workerConfig(settings);
+  const decision = decideWorkerTick({
+    cfg,
+    localRunnerBusy: state.loopAlive || state.launching,
+    nowMs: Date.now(),
+    scanning: false,
+  });
+  if (decision.action === "disabled") {
+    await writeLaneSession({ status: "off", phase: "disabled", laneName: cfg.laneName });
+    return "disabled";
+  }
+  if (decision.action === "incomplete_config") {
+    await writeLaneSession({
+      status: "error",
+      phase: "config",
+      laneName: cfg.laneName,
+      lastError: decision.error || "incomplete_config",
+      backendHost: cfg.origin,
+    });
+    return "incomplete_config";
+  }
+  if (decision.action === "backoff") {
+    await writeLaneSession({
+      status: "blocked",
+      phase: "backoff",
+      laneName: cfg.laneName,
+      lastError: "block_backoff",
+      backendHost: cfg.origin,
+    });
+    return "backoff";
+  }
+  if (decision.action === "deferred_local_job") {
+    await writeLaneSession({ status: "idle", phase: "waiting_for_local_job", laneName: cfg.laneName, backendHost: cfg.origin });
+    return "deferred_local_job";
+  }
+
+  await writeLaneSession({ status: "claiming", phase: "claim", laneName: cfg.laneName, backendHost: cfg.origin, lastError: "" });
+  const client = createWorkerClient({ fetchImpl: fetch, backendUrl: cfg.backendUrl, anonKey: cfg.anonKey });
+  let claim;
+  try {
+    claim = await client.claimJob(cfg.laneName, cfg.leaseSeconds);
+  } catch (error) {
+    await writeLaneSession({ status: "error", phase: "claim", laneName: cfg.laneName, lastError: String(error?.message || error).slice(0, 200) });
+    return "error";
+  }
+  if (claim?.ok === false) {
+    await writeLaneSession({ status: "error", phase: "claim", laneName: cfg.laneName, lastError: claim.error || "claim_failed" });
+    return "error";
+  }
+  if (!claim?.job) {
+    await writeLaneSession({
+      status: "idle",
+      phase: "waiting",
+      laneName: cfg.laneName,
+      jobId: "",
+      term: "",
+      page: 0,
+      backendHost: cfg.origin,
+    });
+    return "idle";
+  }
+
+  const job = claim.job;
+  const result = await runClaimedSearch({ job, cfg, deps: makeWorkerDeps(client, cfg, job) });
+  if (result.status === "blocked") {
+    await saveSettings({ workerBlockedUntil: Date.now() + cfg.blockBackoffMin * 60000 });
+  }
+  return result.status;
+}
+
+function makeWorkerDeps(client, cfg, job) {
+  let tab = null;
+  return {
+    isCancelled: () => state.workerStop,
+    log: (line) => {
+      console.info(line);
+    },
+    sleep: delay,
+    writeSession: (partial) => writeLaneSession(partial),
+    openHome: async () => {
+      tab = await getOrCreateWorkerTab();
+      await showWorkerTab(tab);
+      if (!isEtsyPage(tab.url || "")) {
+        await navigateAndWait(tab.id, "https://www.etsy.com/");
+        tab = await chrome.tabs.get(tab.id);
+      }
+      return tab;
+    },
+    typeAndSubmit: async (term) => {
+      tab = tab || (await getOrCreateWorkerTab());
+      await showWorkerTab(tab);
+      return sendTabMessageRetry(tab.id, {
+        action: "worker.typeAndSubmit",
+        input: { term, keystrokeMinMs: cfg.keystrokeMinMs, keystrokeMaxMs: cfg.keystrokeMaxMs },
+      });
+    },
+    waitForSearch: async (term) => {
+      const landed = await waitForTabUrl(
+        tab.id,
+        (next) => isEtsySearchForTerm(next.url, term),
+        randomInRange(RUNNER_DEFAULTS.navigationTimeoutMinMs, RUNNER_DEFAULTS.navigationTimeoutMaxMs),
+      );
+      return landed?.url || null;
+    },
+    navigate: async (url) => {
+      await navigateAndWait(tab.id, url);
+      tab = await chrome.tabs.get(tab.id);
+      return tab.url;
+    },
+    clickNext: (currentPage) => sendTabMessageRetry(tab.id, { action: "worker.clickNext", input: { currentPage } }),
+    waitForNavigation: async () => {
+      const before = tab.url;
+      const landed = await waitForTabUrl(
+        tab.id,
+        (next) => next.url && next.url !== before,
+        randomInRange(RUNNER_DEFAULTS.navigationTimeoutMinMs, RUNNER_DEFAULTS.navigationTimeoutMaxMs),
+      );
+      if (landed) await delay(randomInRange(300, 700));
+      return landed?.url || null;
+    },
+    extractPage: async () => {
+      await delay(randomInRange(300, 700));
+      const response = await sendTabMessageRetry(tab.id, { action: "search.scrollAndExtract" });
+      if (response?.payload) {
+        try {
+          await saveSearchResults(response.payload);
+        } catch {
+          // the backend upload is the lane's record; the local copy is best-effort
+        }
+      }
+      return {
+        payload: response?.payload || { results: [], totalResults: null },
+        block: response?.block || { blocked: false },
+      };
+    },
+    upload: (body) => client.uploadResults({
+      jobId: body.jobId || job.id,
+      laneName: cfg.laneName,
+      listings: body.listings,
+      page: body.page,
+      totalResults: body.totalResults,
+      leaseSeconds: cfg.leaseSeconds,
+    }),
+    heartbeat: (progress) => client.heartbeat(cfg.laneName, progress.jobId || job.id, progress, cfg.leaseSeconds),
+    complete: (progress) => client.completeJob(progress.jobId || job.id, cfg.laneName, progress),
+    fail: (info) => client.failJob(info.jobId || job.id, cfg.laneName, info.error, info.blocked === true),
+  };
 }

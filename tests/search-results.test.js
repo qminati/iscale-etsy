@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSearchResults, mergeSearchResult, searchResultKey, globalRank, MAX_APPEARANCES } from "../src/core/search-results.js";
+import { detectSearchBlock, parseSearchResults, parseTotalResults, mergeSearchResult, searchResultKey, globalRank, MAX_APPEARANCES } from "../src/core/search-results.js";
 
 function setBody(html) {
   document.body.innerHTML = html;
@@ -55,6 +55,54 @@ describe("parseSearchResults", () => {
     const out = parseSearchResults(doc, "https://www.etsy.com/search?q=mug");
     expect(out.results.map((r) => r.listingId)).toEqual(["3333333333", "4444444444"]);
     expect(out.results[1].position).toBe(2);
+  });
+
+  it("captures the search total, currency, badges, favorites, tags, and sales signals", () => {
+    const doc = setBody(`
+      <h1><span>1,248 results, with ads</span></h1>
+      <li data-listing-id="5555555555">
+        <a href="/listing/5555555555/apron">Apron</a>
+        <h3>Linen apron</h3>
+        <span class="currency-symbol">£</span><span class="currency-value">18.00</span>
+        <span>Bestseller</span>
+        <span>Popular now</span>
+        <span>1,024 favorites</span>
+        <span class="wt-tag" data-tag>linen</span>
+        <span>In 12 carts</span>
+        <img src="apron.jpg" />
+      </li>
+    `);
+    const out = parseSearchResults(doc, "https://www.etsy.com/search?q=linen%20apron");
+    expect(out.totalResults).toBe(1248);
+    expect(parseTotalResults(doc)).toBe(1248);
+    expect(out.results[0]).toMatchObject({
+      price: "£18.00",
+      priceNumeric: 18,
+      currency: "GBP",
+      favorites: 1024,
+      isBestseller: true,
+      isPopular: true,
+      salesSignal: "In 12 carts",
+      tags: ["linen"],
+    });
+  });
+});
+
+describe("detectSearchBlock", () => {
+  it("does not treat a normal results page as a block", () => {
+    const doc = setBody(`<a href="/listing/5555555555/apron">Apron</a><p>1,248 results</p>`);
+    expect(detectSearchBlock(doc)).toEqual({ blocked: false, reason: null });
+  });
+
+  it("does not treat an empty search as a captcha", () => {
+    const doc = setBody(`<h1>0 results for linen apron</h1><p>We couldn't find any results.</p>`);
+    expect(detectSearchBlock(doc).blocked).toBe(false);
+  });
+
+  it("stops on a captcha interstitial", () => {
+    const doc = setBody(`<title>Just a moment</title><h1>Verify you are a human</h1><iframe src="https://geo.captcha-delivery.com/captcha/"></iframe>`);
+    document.title = "Just a moment";
+    expect(detectSearchBlock(doc)).toEqual({ blocked: true, reason: "captcha" });
   });
 });
 

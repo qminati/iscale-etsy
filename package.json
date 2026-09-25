@@ -1,15 +1,16 @@
 {
   "name": "iscale-etsy",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": false,
   "type": "module",
-  "description": "Local-first Chrome extension for Etsy research: manual collection, batch jobs, search-result capture, a local Shop View, and CSV export.",
+  "description": "Local-first Chrome extension for Etsy research: manual collection, batch jobs, search-result capture, a local Shop View, CSV export, and an optional backend worker lane.",
   "license": "MIT",
   "author": "iScaleLabs",
   "scripts": {
     "test": "vitest run tests",
     "lint": "eslint \"**/*.js\"",
-    "package": "node scripts/package.mjs"
+    "package": "node scripts/package.mjs",
+    "worker": "node scripts/etsy-worker.mjs"
   },
   "keywords": [
     "etsy",
@@ -20,6 +21,7 @@
     "local-first"
   ],
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@eslint/js": "^9.39.4",
     "eslint": "^9.39.4",
     "fake-indexeddb": "^6.2.5",

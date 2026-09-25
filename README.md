@@ -53,7 +53,8 @@ are parsed locally in your browser. CSV exports are generated locally from your
 browser data.
 
 There is no Supabase dependency, no hosted database, no account system, and no
-private iScaleLabs production endpoint in this public edition.
+private iScaleLabs production endpoint in this public edition. Optional worker
+mode, described below, stays off until you point it at a backend you run.
 
 ## Install From Source
 
@@ -169,6 +170,36 @@ The extension is designed around explicit local actions such as:
 
 This keeps the human UI and future agent/chat control working against the same
 local state model.
+
+## Optional worker mode
+
+Worker mode is off unless you turn it on. Local collection, batch jobs, Shop
+View, and CSV export behave the same when it stays off.
+
+When it is on, a headed Chrome window becomes a lane. An agent adds Etsy search
+terms through `scripts/etsy-worker.mjs`. The lane claims the next term, focuses
+Etsy's search box, types the term, and submits the search. If the box is not on
+the page, it opens the search URL instead and logs which path it used. It reads
+Etsy's total result count, uploads that page's listings, then paginates. Rows
+land after the first results page, not at the end of the scan. A captcha or
+block stops the lane and is reported on the job.
+
+Nothing in the extension or the CLI is a backend URL or key. You set those in
+the extension's options and in `ETSY_WORKER_URL` / `ETSY_WORKER_ANON_KEY`.
+
+```bash
+export ETSY_WORKER_URL="https://YOUR_PROJECT.supabase.co"
+export ETSY_WORKER_ANON_KEY="your-publishable-anon-key"
+
+npm run worker -- add-terms "linen apron" --priority 10 --pages 2
+npm run worker -- status --term "linen apron"
+npm run worker -- results --term "linen apron" --json
+npm run worker -- search-now "rush term" --pages 1
+```
+
+Setup, several lanes, health, stuck jobs, and a smoke test are in
+[docs/worker-runbook.md](docs/worker-runbook.md). The SQL is in
+[supabase/migrations](supabase/migrations/).
 
 ## Project Scripts
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0 — Optional backend worker lane
+
+- Add an opt-in worker mode. It is off by default and has no baked-in backend
+  URL or key. A visible Chrome window claims Etsy searches, types them into
+  the search box, and uploads each results page as it finishes, including the
+  search's total result count.
+- Ship Postgres migrations and RPCs for a priority queue with claim leases,
+  heartbeats, idempotent completion, and re-queue of expired leases.
+- Add `scripts/etsy-worker.mjs` (`add-terms`, `search-now`, `status`,
+  `results --json`, `health`, `requeue`) and a worker runbook.
+- `storage` is used for lane state in `chrome.storage.session`. Backend host
+  access is an optional permission granted from the options page.
+
 ## 1.0.2 — Durable runner-tab reuse
 
 - Persist the hidden Etsy runner tab id and reuse it after MV3 service-worker

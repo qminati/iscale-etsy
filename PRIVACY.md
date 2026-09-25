@@ -17,12 +17,25 @@ Data is stored in Chrome's local browser storage through IndexedDB.
 
 This public edition does not include:
 
-- a hosted database
+- a hosted database of its own
 - account login
 - cloud sync
-- Supabase writes
+- a bundled Supabase project, URL, or key
 - private iScaleLabs production endpoints
 - telemetry or analytics
+
+## Optional worker mode
+
+Worker mode is off by default. While it is off, the extension does not contact
+a backend and does not write lane state.
+
+If you turn it on in the extension options, you supply the backend URL and
+publishable key. The lane then sends the search term it claimed and the
+listing fields it scraped (title, shop, price, badges, tags, image, URL,
+position, page, and the search's total result count) to that backend. The key
+stays in your browser's local IndexedDB settings. Live lane progress is kept
+in `chrome.storage.session`, which Chrome clears when the browser session
+ends. That record does not include the key.
 
 ## CSV Files
 

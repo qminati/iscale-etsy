@@ -3,9 +3,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { describe, it, expect } from "vitest";
 
-// Content scripts (content.js, passive.js) can't import ES modules, so they
-// hand-mirror src/core logic. These checks fail if a copy drifts from its
-// canonical module — the same pattern as passive-demand-parity.test.js.
+// passive.js can't import ES modules, so it hand-mirrors src/core logic.
+// content.js is a module content script and imports the canonical parser.
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(join(here, "..", p), "utf8");
@@ -26,18 +25,14 @@ function bothContain(name, a, b, signatures) {
   });
 }
 
-bothContain("content.js search parse mirrors search-results.js", searchResultsSrc, contentSrc, [
-  "closestCard",
-  ".currency-value",
-  ".currency-symbol",
-  "out of 5",
-  'aria-label*="review"',
-  "data-listing-id",
-  "v2-listing-card|listing-link|wt-grid__item|js-merch-stash-check-listing",
-  "ad by",
-  "advertisement",
-  "(\\d{7,12})",
-]);
+describe("content.js search parse uses the canonical module", () => {
+  it("imports parseSearchResults and detectSearchBlock", () => {
+    expect(contentSrc).toContain('import { detectSearchBlock, parseSearchResults } from "./src/core/search-results.js"');
+    expect(contentSrc).not.toContain("function parseSearchResults(");
+    expect(searchResultsSrc).toContain("export function parseSearchResults");
+    expect(searchResultsSrc).toContain("export function detectSearchBlock");
+  });
+});
 
 bothContain("passive.js listing capture mirrors extract-listing.js", extractListingSrc, passiveSrc, [
   "data-favorite-listing-id",
