@@ -147,7 +147,9 @@ els.health.addEventListener("click", async () => {
     show(response.error || response.result?.error || "Health check failed.", "error");
     return;
   }
-  show("Backend health check succeeded.", "ok");
+  const role = response.result?.role || "operator";
+  const lane = response.result?.lane_name ? ` (${response.result.lane_name})` : "";
+  show(`Signed in as ${role}${lane}.`, "ok");
   els.lane.textContent = JSON.stringify(response.result, null, 2);
 });
 

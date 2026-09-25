@@ -42,4 +42,14 @@ describe("shop page targets", () => {
     document.body.innerHTML = "<p>attention required</p>";
     expect(parseShopPage(document, "https://www.etsy.com/shop/CoolShop").block).toMatchObject({ blocked: true, reason: "captcha" });
   });
+
+  it("does not treat a shop page that is still loading as an empty search", () => {
+    document.title = "CoolShop";
+    const doc = setBody("<h1>CoolShop</h1><p>Loading</p>");
+    expect(parseShopPage(doc, "https://www.etsy.com/shop/CoolShop").block).toEqual({
+      blocked: false,
+      reason: null,
+      noResults: false,
+    });
+  });
 });

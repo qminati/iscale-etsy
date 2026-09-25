@@ -171,7 +171,18 @@ function parseTotalResults(doc) {
   return parseTotalResultsDetail(doc).count;
 }
 
-function detectSearchBlock(doc) {
+function isSearchLocation(href) {
+  const text = String(href || "");
+  if (!text) return false;
+  try {
+    const url = new URL(text, "https://www.etsy.com");
+    return url.pathname === "/search" || url.pathname.startsWith("/search/");
+  } catch {
+    return false;
+  }
+}
+
+function detectSearchBlock(doc, href) {
   const title = String(doc?.title || doc?.querySelector?.("title")?.textContent || "");
   const bodyText = String(doc?.body?.innerText || doc?.body?.textContent || "").slice(0, 2000);
   const listingCount = doc?.querySelectorAll?.('a[href*="/listing/"]')?.length || 0;
@@ -188,9 +199,12 @@ function detectSearchBlock(doc) {
     const reason = /captcha|human|recaptcha|hcaptcha/i.test(`${title}\n${bodyText}`) || challengeDom ? "captcha" : "blocked";
     return { blocked: true, reason, noResults: false };
   }
-  // A search page with nothing to read and no empty-state marker is not a
-  // successful zero. Callers must stop instead of completing the job.
-  if (listingCount === 0) return { blocked: true, reason: "suspicious_empty", noResults: false };
+  // Only a search URL with nothing to read and no empty-state marker is
+  // suspicious. A shop or listing page can be empty while it is still loading.
+  const pageHref = href || doc?.location?.href || "";
+  if (listingCount === 0 && isSearchLocation(pageHref)) {
+    return { blocked: true, reason: "suspicious_empty", noResults: false };
+  }
   return { blocked: false, reason: null, noResults: false };
 }
 
@@ -233,7 +247,7 @@ function parseSearchResults(doc, href, nowIso) {
     });
   }
   const totals = parseTotalResultsDetail(doc);
-  const block = detectSearchBlock(doc);
+  const block = detectSearchBlock(doc, href);
   return {
     keyword,
     page,

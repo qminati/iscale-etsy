@@ -7,6 +7,16 @@
 -- types use their own subject key so they cannot collide with a search term.
 -- Listings stay RPC-only. Export and stats snapshots live in payloads, also
 -- RPC-only.
+-- Do not run this file again after 20260925160000_etsy_worker_auth.sql.
+
+begin;
+
+do $$
+begin
+  if to_regclass('etsy_worker.operators') is not null then
+    raise exception 'Refusing to re-apply 20260925140000_etsy_worker_commands.sql because etsy_worker.operators already exists. Re-running it would grant anon and replace the auth wrappers.';
+  end if;
+end $$;
 
 alter table etsy_worker.jobs
   add column if not exists job_type text not null default 'search',
@@ -999,3 +1009,5 @@ begin
     execute format('grant execute on function public.%s to anon, authenticated, service_role', fn);
   end loop;
 end $$;
+
+commit;

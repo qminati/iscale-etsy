@@ -9,11 +9,27 @@ listing visits, shop pages, export, and collection stats.
 `etsy_worker.operators` row. Apply all three files yourself, in that order.
 This repository does not connect to a database.
 
-In the Supabase SQL editor (or `psql` against a database you control), paste
-and run each migration file. Create the project first. Disable public
-signups, create one Auth user per lane and one for agents, then insert
-operator rows. Do not put the project URL, the publishable key, or passwords
-in git.
+Check the shared database first, then apply the three files in one `psql`
+invocation. Each migration file is its own transaction.
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/preflight-etsy-worker.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/apply-etsy-worker.sql
+```
+
+The SQL editor does not accept `\ir`. Paste the three migration files there,
+in order. Create Auth users in the dashboard. The operators table is the
+access gate, so public signups can stay enabled for the other apps on this
+project. Insert one operator row per user, with `lane_name` for a lane:
+
+```sql
+insert into etsy_worker.operators (user_id, role, lane_name) values
+  ('<lane-user-uuid>', 'lane', 'lane-1'),
+  ('<agent-user-uuid>', 'agent', null);
+```
+
+Do not put the project URL, the publishable key, or passwords in git. Do not
+re-run the first or second migration after `etsy_worker.operators` exists.
 
 After they run:
 

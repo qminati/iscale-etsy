@@ -152,11 +152,11 @@
       simulateHumanScrolling()
         .then(() => {
           const payload = readSearchResults();
-          sendResponse({ urls: extractSearchLinks(), payload, block: detectSearchBlock(document) });
+          sendResponse({ urls: extractSearchLinks(), payload, block: detectSearchBlock(document, location.href) });
         })
         .catch(() => {
           const payload = readSearchResults();
-          sendResponse({ urls: extractSearchLinks(), payload, block: detectSearchBlock(document) });
+          sendResponse({ urls: extractSearchLinks(), payload, block: detectSearchBlock(document, location.href) });
         });
       return true;
     }

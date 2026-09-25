@@ -4,17 +4,31 @@
 -- 20260925140000_etsy_worker_commands.sql. The publishable key stays in the
 -- apikey header. Callers must be signed-in Auth users with a row in
 -- etsy_worker.operators. anon and public cannot execute these RPCs.
---
--- Disable public signups. Create one Auth user per lane and one for agents,
--- then insert operator rows from the SQL editor:
---   insert into etsy_worker.operators (user_id, role)
---   values ('<lane-user-uuid>', 'lane'), ('<agent-user-uuid>', 'agent');
+-- The operators table is the access gate. This file does not change who can
+-- sign up for the project. Create Auth users in the dashboard, then:
+--   insert into etsy_worker.operators (user_id, role, lane_name) values
+--     ('<lane-user-uuid>', 'lane', 'lane-1'),
+--     ('<agent-user-uuid>', 'agent', null);
+-- Re-running this file is a no-op once the wrappers are in place.
+
+begin;
 
 create table if not exists etsy_worker.operators (
   user_id uuid primary key references auth.users (id) on delete cascade,
-  role text not null check (role in ('lane', 'agent', 'admin')),
+  role text not null,
+  lane_name text,
   created_at timestamptz not null default now()
 );
+
+alter table etsy_worker.operators add column if not exists lane_name text;
+alter table etsy_worker.operators drop constraint if exists operators_role_check;
+alter table etsy_worker.operators drop constraint if exists operators_role_lane_check;
+alter table etsy_worker.operators
+  add constraint operators_role_lane_check check (
+    role in ('lane', 'agent', 'admin')
+    and (role <> 'lane' or lane_name is not null)
+    and (lane_name is null or etsy_worker.valid_lane(lane_name) = lane_name)
+  );
 
 alter table etsy_worker.operators enable row level security;
 revoke all on etsy_worker.operators from public, anon, authenticated;
@@ -38,8 +52,8 @@ revoke all on function etsy_worker.is_operator() from public, anon, authenticate
 grant execute on function etsy_worker.is_operator() to authenticated;
 
 -- Returns null when the caller may proceed, otherwise an error code.
--- A successful check sets a transaction-local flag so a lane RPC can call
--- another public RPC (claim calls requeue) without a second role check.
+-- There is no session-variable bypass. Wrappers call etsy_worker implementations
+-- directly. Those implementations are not executable by anon or authenticated.
 create or replace function etsy_worker.require_operator(p_roles text[])
 returns text
 language plpgsql
@@ -50,9 +64,6 @@ declare
   v_uid uuid;
   v_role text;
 begin
-  if current_setting('etsy_worker.authed', true) = '1' then
-    return null;
-  end if;
   v_uid := auth.uid();
   if v_uid is null then
     return 'not_authenticated';
@@ -64,13 +75,61 @@ begin
   if v_role <> 'admin' and not (v_role = any (coalesce(p_roles, '{}'::text[]))) then
     return 'not_authorized';
   end if;
-  perform set_config('etsy_worker.authed', '1', true);
   return null;
 end;
 $fn$;
 
 revoke all on function etsy_worker.require_operator(text[]) from public, anon, authenticated;
 
+-- Lane RPCs must use the lane_name stored for this user. Admin is exempt.
+create or replace function etsy_worker.require_lane(p_lane_name text)
+returns text
+language plpgsql
+security definer
+set search_path = etsy_worker, public
+as $fn$
+declare
+  v_auth text;
+  v_role text;
+  v_bound text;
+  v_lane text;
+begin
+  v_auth := etsy_worker.require_operator(array['lane']::text[]);
+  if v_auth is not null then
+    return v_auth;
+  end if;
+  select role, lane_name into v_role, v_bound
+  from etsy_worker.operators
+  where user_id = auth.uid();
+  if v_role = 'admin' then
+    return null;
+  end if;
+  v_lane := etsy_worker.valid_lane(p_lane_name);
+  if v_lane is null or v_bound is distinct from v_lane then
+    return 'lane_mismatch';
+  end if;
+  return null;
+end;
+$fn$;
+
+revoke all on function etsy_worker.require_lane(text) from public, anon, authenticated;
+
+-- Replace implementations only on the first apply. A second run leaves the
+-- public wrappers (and their auth checks) in place.
+do $guard$
+begin
+  if exists (
+    select 1
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.proname = 'etsy_worker_claim_job'
+      and (p.prosrc like '%require_lane%' or p.prosrc like '%require_operator%')
+  ) then
+    return;
+  end if;
+
+  execute $body$
 -- Lock every accepted term before writing any of them, in sorted order, so two
 -- overlapping add_terms calls cannot deadlock on advisory locks.
 create or replace function public.etsy_worker_add_terms(
@@ -312,6 +371,9 @@ begin
   if p_listings is null or jsonb_typeof(p_listings) <> 'array' then
     return jsonb_build_object('ok', false, 'error', 'p_listings must be a json array');
   end if;
+  if jsonb_array_length(p_listings) > 500 then
+    return jsonb_build_object('ok', false, 'error', 'too_many_rows');
+  end if;
 
   select * into r from etsy_worker.jobs where id = p_job_id for update;
   if not found then
@@ -438,51 +500,132 @@ begin
   );
 end;
 $fn$;
+$body$;
+end
+$guard$;
 
--- Move each public RPC into etsy_worker and leave a wrapper that checks the
--- operator role. Lane calls may claim, heartbeat, upload, complete, and fail.
--- Agent calls may enqueue, add terms, and read status or results. Admin may do both.
-do $$
+-- Move each known public RPC into etsy_worker and leave a wrapper that checks
+-- the operator role. The list is closed: a LIKE match is not enough, because
+-- "_" is a wildcard and this project shares the public schema.
+-- Lane calls may claim, heartbeat, upload, complete, and fail, and only for
+-- the lane_name on their operator row. Agent calls may enqueue and read.
+-- Admin may do both. Re-running replaces the wrappers and does not move them.
+do $install$
 declare
   r record;
-  v_roles text;
+  v_check text;
   v_args text;
   v_defs text;
+  v_wrapped integer := 0;
+  v_def text;
+  v_impl oid;
+  v_public oid;
+  v_src text;
 begin
   for r in
-    select
-      p.proname,
-      pg_get_function_identity_arguments(p.oid) as ident,
-      pg_get_function_arguments(p.oid) as defs,
-      coalesce(array_to_string(p.proargnames, ', '), '') as args
-    from pg_proc p
-    join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'public'
-      and p.proname like 'etsy_worker_%'
-    order by p.proname
+    select allowed.proname, allowed.args
+    from (
+      values
+        ('etsy_worker_add_terms', 'jsonb, integer, integer, text'),
+        ('etsy_worker_claim_job', 'text, integer'),
+        ('etsy_worker_complete_job', 'uuid, text, jsonb'),
+        ('etsy_worker_enqueue', 'text, jsonb, integer'),
+        ('etsy_worker_fail_job', 'uuid, text, text, boolean, boolean, boolean'),
+        ('etsy_worker_fleet_status', ''),
+        ('etsy_worker_health', ''),
+        ('etsy_worker_heartbeat', 'text, uuid, jsonb, integer'),
+        ('etsy_worker_job_results', 'uuid, integer, integer'),
+        ('etsy_worker_job_status', 'uuid'),
+        ('etsy_worker_lookup', 'text, text'),
+        ('etsy_worker_requeue_expired', ''),
+        ('etsy_worker_results', 'text, integer, integer'),
+        ('etsy_worker_search_now', 'text, integer, text'),
+        ('etsy_worker_term_status', 'text'),
+        ('etsy_worker_upload_payload', 'uuid, text, text, jsonb, integer'),
+        ('etsy_worker_upload_results', 'uuid, text, jsonb, integer, integer, integer, text')
+    ) as allowed(proname, args)
+    where allowed.proname like 'etsy\_worker\_%' escape e'\\'
   loop
-    execute format('alter function public.%I(%s) set schema etsy_worker', r.proname, r.ident);
+    v_public := to_regprocedure(format('public.%I(%s)', r.proname, r.args));
+    if v_public is null then
+      continue;
+    end if;
+    select prosrc into v_src from pg_proc where oid = v_public;
+    if v_src like '%require_lane%' or v_src like '%require_operator%' then
+      continue;
+    end if;
+    execute format('alter function %s set schema etsy_worker', v_public::regprocedure::text);
     execute format(
       'revoke all on function etsy_worker.%I(%s) from public, anon, authenticated, service_role',
       r.proname,
-      r.ident
+      r.args
+    );
+  end loop;
+
+  for r in
+    select allowed.proname, allowed.args
+    from (
+      values
+        ('etsy_worker_add_terms', 'jsonb, integer, integer, text'),
+        ('etsy_worker_claim_job', 'text, integer'),
+        ('etsy_worker_complete_job', 'uuid, text, jsonb'),
+        ('etsy_worker_enqueue', 'text, jsonb, integer'),
+        ('etsy_worker_fail_job', 'uuid, text, text, boolean, boolean, boolean'),
+        ('etsy_worker_fleet_status', ''),
+        ('etsy_worker_health', ''),
+        ('etsy_worker_heartbeat', 'text, uuid, jsonb, integer'),
+        ('etsy_worker_job_results', 'uuid, integer, integer'),
+        ('etsy_worker_job_status', 'uuid'),
+        ('etsy_worker_lookup', 'text, text'),
+        ('etsy_worker_requeue_expired', ''),
+        ('etsy_worker_results', 'text, integer, integer'),
+        ('etsy_worker_search_now', 'text, integer, text'),
+        ('etsy_worker_term_status', 'text'),
+        ('etsy_worker_upload_payload', 'uuid, text, text, jsonb, integer'),
+        ('etsy_worker_upload_results', 'uuid, text, jsonb, integer, integer, integer, text')
+    ) as allowed(proname, args)
+    where allowed.proname like 'etsy\_worker\_%' escape e'\\'
+  loop
+    v_impl := to_regprocedure(format('etsy_worker.%I(%s)', r.proname, r.args));
+    if v_impl is null then
+      raise exception 'Refusing to continue: etsy_worker.% (%) is not an implementation', r.proname, r.args;
+    end if;
+    select prosrc into v_src from pg_proc where oid = v_impl;
+    if v_src like '%require_operator%' or v_src like '%require_lane%' then
+      raise exception 'Refusing to continue: etsy_worker.% looks like a wrapper, not an implementation', r.proname;
+    end if;
+
+    v_def := pg_get_functiondef(v_impl);
+    if position('public.etsy_worker_' in v_def) > 0 then
+      execute replace(v_def, 'public.etsy_worker_', 'etsy_worker.etsy_worker_');
+      v_impl := to_regprocedure(format('etsy_worker.%I(%s)', r.proname, r.args));
+    end if;
+    execute format(
+      'revoke all on function etsy_worker.%I(%s) from public, anon, authenticated, service_role',
+      r.proname,
+      r.args
     );
 
-    v_roles := case r.proname
-      when 'etsy_worker_claim_job' then 'array[''lane'']::text[]'
-      when 'etsy_worker_heartbeat' then 'array[''lane'']::text[]'
-      when 'etsy_worker_upload_results' then 'array[''lane'']::text[]'
-      when 'etsy_worker_upload_payload' then 'array[''lane'']::text[]'
-      when 'etsy_worker_complete_job' then 'array[''lane'']::text[]'
-      when 'etsy_worker_fail_job' then 'array[''lane'']::text[]'
-      when 'etsy_worker_requeue_expired' then 'array[''lane'',''agent'']::text[]'
-      else 'array[''agent'']::text[]'
+    select
+      pg_get_function_arguments(p.oid),
+      coalesce(array_to_string(p.proargnames, ', '), '')
+    into v_defs, v_args
+    from pg_proc p
+    where p.oid = v_impl;
+
+    v_check := case r.proname
+      when 'etsy_worker_claim_job' then 'etsy_worker.require_lane(p_lane_name)'
+      when 'etsy_worker_heartbeat' then 'etsy_worker.require_lane(p_lane_name)'
+      when 'etsy_worker_upload_results' then 'etsy_worker.require_lane(p_lane_name)'
+      when 'etsy_worker_upload_payload' then 'etsy_worker.require_lane(p_lane_name)'
+      when 'etsy_worker_complete_job' then 'etsy_worker.require_lane(p_lane_name)'
+      when 'etsy_worker_fail_job' then 'etsy_worker.require_lane(p_lane_name)'
+      when 'etsy_worker_requeue_expired' then 'etsy_worker.require_operator(array[''lane'',''agent'']::text[])'
+      else 'etsy_worker.require_operator(array[''agent'']::text[])'
     end;
-    v_defs := r.defs;
-    v_args := r.args;
 
     execute format($sql$
-      create function public.%I(%s)
+      create or replace function public.%I(%s)
       returns jsonb
       language plpgsql
       security definer
@@ -491,19 +634,55 @@ begin
       declare
         v_auth text;
       begin
-        v_auth := etsy_worker.require_operator(%s);
+        v_auth := %s;
         if v_auth is not null then
           return jsonb_build_object('ok', false, 'error', v_auth);
         end if;
         return etsy_worker.%I(%s);
       end;
       $wrap$;
-    $sql$, r.proname, v_defs, v_roles, r.proname, v_args);
+    $sql$, r.proname, v_defs, v_check, r.proname, v_args);
 
-    execute format('revoke all on function public.%I(%s) from public, anon, service_role', r.proname, r.ident);
-    execute format('grant execute on function public.%I(%s) to authenticated', r.proname, r.ident);
+    execute format('revoke all on function public.%I(%s) from public, anon, service_role', r.proname, r.args);
+    execute format('grant execute on function public.%I(%s) to authenticated', r.proname, r.args);
+    v_wrapped := v_wrapped + 1;
   end loop;
-end $$;
+
+  if v_wrapped <> 17 then
+    raise exception 'Refusing to continue: expected 17 etsy_worker RPC wrappers, wrote %', v_wrapped;
+  end if;
+end
+$install$;
+
+create or replace function public.etsy_worker_lane_whoami()
+returns jsonb
+language plpgsql
+security definer
+set search_path = etsy_worker, public
+as $fn$
+declare
+  v_auth text;
+  v_role text;
+  v_lane text;
+begin
+  v_auth := etsy_worker.require_operator(array['lane', 'agent']::text[]);
+  if v_auth is not null then
+    return jsonb_build_object('ok', false, 'error', v_auth);
+  end if;
+  select role, lane_name into v_role, v_lane
+  from etsy_worker.operators
+  where user_id = auth.uid();
+  return jsonb_build_object(
+    'ok', true,
+    'role', v_role,
+    'lane_name', v_lane,
+    'server_time', now()
+  );
+end;
+$fn$;
+
+revoke all on function public.etsy_worker_lane_whoami() from public, anon, service_role;
+grant execute on function public.etsy_worker_lane_whoami() to authenticated;
 
 revoke select on etsy_worker.jobs from anon;
 grant select on etsy_worker.jobs to authenticated;
@@ -514,3 +693,5 @@ create policy jobs_select_for_realtime
   for select
   to authenticated
   using (etsy_worker.is_operator());
+
+commit;

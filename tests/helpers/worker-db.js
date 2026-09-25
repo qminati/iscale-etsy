@@ -33,10 +33,10 @@ export async function createWorkerDb() {
       ('${ADMIN_ID}', 'admin@example.test'),
       ('${LANE_ID}', 'lane@example.test'),
       ('${AGENT_ID}', 'agent@example.test');
-    insert into etsy_worker.operators (user_id, role) values
-      ('${ADMIN_ID}', 'admin'),
-      ('${LANE_ID}', 'lane'),
-      ('${AGENT_ID}', 'agent');
+    insert into etsy_worker.operators (user_id, role, lane_name) values
+      ('${ADMIN_ID}', 'admin', null),
+      ('${LANE_ID}', 'lane', 'lane-1'),
+      ('${AGENT_ID}', 'agent', null);
   `);
   await setUid(db, ADMIN_ID);
   return db;

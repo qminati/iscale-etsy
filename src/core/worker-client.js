@@ -14,6 +14,7 @@ export const WORKER_RPC = {
   failJob: "etsy_worker_fail_job",
   requeueExpired: "etsy_worker_requeue_expired",
   health: "etsy_worker_health",
+  laneWhoami: "etsy_worker_lane_whoami",
   termStatus: "etsy_worker_term_status",
   results: "etsy_worker_results",
   fleetStatus: "etsy_worker_fleet_status",
@@ -142,6 +143,9 @@ export function createWorkerClient({ fetchImpl, backendUrl, anonKey, accessToken
     },
     health() {
       return rpc(WORKER_RPC.health, {});
+    },
+    laneWhoami() {
+      return rpc(WORKER_RPC.laneWhoami, {});
     },
     termStatus(term) {
       return rpc(WORKER_RPC.termStatus, { p_term: term });

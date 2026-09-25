@@ -38,7 +38,9 @@ const fixture = `<!doctype html>
   </body>
 </html>`;
 
-describe("unpacked extension content script", () => {
+const chromeSmoke = process.env.ETSY_E2E_CHROME === "1";
+
+describe.skipIf(!chromeSmoke)("unpacked extension content script", () => {
   it("answers a content-script message on a static Etsy fixture", async () => {
     const executablePath = await chromeForTesting();
     const browser = await puppeteer.launch({

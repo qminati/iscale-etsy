@@ -19,7 +19,7 @@ import { ensureWorkerSession, signInWithPassword } from "./src/core/worker-auth.
 import { isEtsySearchForTerm } from "./src/core/search-box.js";
 import { decideWorkerTick, interpretBlockReply, planDrainStep, workerTabReusable } from "./src/core/worker-loop.js";
 import { runWorkerJob, shapeExport, shapeStats } from "./src/core/worker-commands.js";
-import { isPendingJobWake, parseRealtimeMessage, realtimeHeartbeatMessage, realtimeJoinMessage, realtimeWebSocketUrl } from "./src/core/worker-realtime.js";
+import { isPendingJobWake, parseRealtimeMessage, realtimeAccessTokenMessage, realtimeHeartbeatMessage, realtimeJoinMessage, realtimeWebSocketUrl } from "./src/core/worker-realtime.js";
 
 const state = {
   activeJobId: null,
@@ -35,6 +35,7 @@ const state = {
   launching: false, // true between claiming the runner slot and launchJob setting loopAlive
   cancelledTerms: new Set(), // terms removed mid-run — the runner skips their remaining work
   workerScanning: false,
+  workerPausing: false,
   workerStop: false,
   workerTabId: null,
   workerSocket: null,
@@ -150,6 +151,7 @@ async function refreshBadge() {
 }
 
 async function initFromSettings() {
+  await restrictWorkerAuthStorage();
   await refreshBadge();
   await ensurePopupDefault();
   await migrateQueueToUrlKeyed();
@@ -1613,10 +1615,25 @@ async function writeLaneSession(partial) {
   }
 }
 
+async function restrictWorkerAuthStorage() {
+  try {
+    await chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+  } catch {
+    // Session storage is already limited to the extension in current Chrome.
+  }
+}
+
 async function readWorkerAuth() {
   try {
-    const stored = await chrome.storage.local.get(WORKER_AUTH_KEY);
-    return stored?.[WORKER_AUTH_KEY] || null;
+    await restrictWorkerAuthStorage();
+    const stored = await chrome.storage.session.get(WORKER_AUTH_KEY);
+    if (stored?.[WORKER_AUTH_KEY]?.accessToken) return stored[WORKER_AUTH_KEY];
+    const legacy = await chrome.storage.local.get(WORKER_AUTH_KEY);
+    const migrated = legacy?.[WORKER_AUTH_KEY];
+    if (!migrated?.accessToken) return stored?.[WORKER_AUTH_KEY] || null;
+    await chrome.storage.session.set({ [WORKER_AUTH_KEY]: migrated });
+    await chrome.storage.local.remove(WORKER_AUTH_KEY);
+    return migrated;
   } catch {
     return null;
   }
@@ -1629,7 +1646,13 @@ async function writeWorkerAuth(session) {
     expiresAt: session.expiresAt,
     email: session.email || "",
   };
-  await chrome.storage.local.set({ [WORKER_AUTH_KEY]: next });
+  await restrictWorkerAuthStorage();
+  await chrome.storage.session.set({ [WORKER_AUTH_KEY]: next });
+  try {
+    await chrome.storage.local.remove(WORKER_AUTH_KEY);
+  } catch {
+    // A content script can read chrome.storage.local, so a leftover copy is removed when local is available.
+  }
   return next;
 }
 
@@ -1672,7 +1695,7 @@ async function workerHealth() {
   if (!cfg.ready) return { ok: false, error: cfg.configError || "worker_not_configured" };
   const opened = await openWorkerClient(cfg);
   if (!opened.ok) return opened;
-  return opened.client.health();
+  return opened.client.laneWhoami();
 }
 
 function closeWorkerRealtime() {
@@ -1708,7 +1731,7 @@ async function openWorkerRealtime(cfg) {
   }
   state.workerSocket = ws;
   const ref = { n: 1 };
-  const accessToken = session.accessToken;
+  let accessToken = session.accessToken;
   ws.onopen = () => {
     try {
       ws.send(JSON.stringify(realtimeJoinMessage(String(ref.n++), accessToken)));
@@ -1718,7 +1741,7 @@ async function openWorkerRealtime(cfg) {
   };
   ws.onmessage = (event) => {
     const message = parseRealtimeMessage(event.data);
-    if (!isPendingJobWake(message) || state.workerScanning || state.workerStop) return;
+    if (!isPendingJobWake(message) || state.workerScanning || state.workerPausing || state.workerStop) return;
     drainWorkerQueue().catch(() => {});
   };
   ws.onerror = () => {};
@@ -1731,11 +1754,18 @@ async function openWorkerRealtime(cfg) {
       state.workerSocketTimer = null;
       return;
     }
-    try {
-      ws.send(JSON.stringify(realtimeHeartbeatMessage(String(ref.n++))));
-    } catch {
-      // ignore
-    }
+    ensureWorkerAccess(cfg).then((fresh) => {
+      if (state.workerSocket !== ws || ws.readyState !== 1) return;
+      try {
+        if (fresh?.ok && fresh.accessToken && fresh.accessToken !== accessToken) {
+          accessToken = fresh.accessToken;
+          ws.send(JSON.stringify(realtimeAccessTokenMessage(String(ref.n++), accessToken)));
+        }
+        ws.send(JSON.stringify(realtimeHeartbeatMessage(String(ref.n++))));
+      } catch {
+        // polling still wakes the lane
+      }
+    }).catch(() => {});
   }, 25000);
 }
 
@@ -1767,7 +1797,7 @@ async function ensureWorkerScheduled(settings) {
   await validateSavedWorkerTab();
   if (cfg.ready && cfg.realtime) openWorkerRealtime(cfg);
   else closeWorkerRealtime();
-  if (!state.workerScanning) {
+  if (!state.workerScanning && !state.workerPausing) {
     setTimeout(() => {
       drainWorkerQueue().catch(() => {});
     }, 0);
@@ -1775,7 +1805,7 @@ async function ensureWorkerScheduled(settings) {
 }
 
 async function onWorkerAlarm() {
-  if (state.workerScanning || state.workerStop) return;
+  if (state.workerScanning || state.workerPausing || state.workerStop) return;
   await drainWorkerQueue();
 }
 
@@ -1831,7 +1861,7 @@ async function readClaimTimes(now = Date.now()) {
     return Number.isFinite(age) && age >= 0 && age < 60 * 60 * 1000;
   });
   try {
-    const stored = await chrome.storage.session.get(WORKER_CLAIM_TIMES_KEY);
+    const stored = await chrome.storage.local.get(WORKER_CLAIM_TIMES_KEY);
     return recent(stored?.[WORKER_CLAIM_TIMES_KEY]);
   } catch {
     return recent(state.workerClaimTimes);
@@ -1842,7 +1872,7 @@ async function rememberClaim(now = Date.now()) {
   const times = [...(await readClaimTimes(now)), now].filter((stamp) => now - Number(stamp) < 60 * 60 * 1000);
   state.workerClaimTimes = times;
   try {
-    await chrome.storage.session.set({ [WORKER_CLAIM_TIMES_KEY]: times });
+    await chrome.storage.local.set({ [WORKER_CLAIM_TIMES_KEY]: times });
   } catch {
     // the in-memory list still caps this service-worker lifetime
   }
@@ -1904,15 +1934,17 @@ function waitForTabUrl(tabId, predicate, timeoutMs) {
 }
 
 async function drainWorkerQueue() {
-  if (state.workerScanning || state.loopAlive || state.launching) return;
+  if (state.workerScanning || state.workerPausing || state.loopAlive || state.launching) return;
   state.workerScanning = true;
   let ranJob = false;
+  let pauseDone = false;
+  let releaseScanning = true;
   try {
     while (!state.workerStop) {
       const settings = await getSettings();
       const cfg = workerConfig(settings);
       const step = planDrainStep({
-        ranJob,
+        ranJob: ranJob && !pauseDone,
         claimTimes: await readClaimTimes(),
         nowMs: Date.now(),
         cap: cfg.jobsPerHour,
@@ -1929,12 +1961,24 @@ async function drainWorkerQueue() {
         break;
       }
       if (step.action === "pause") {
+        // Release the busy flag for the between-jobs gap so a local Run is not refused.
+        // Claim time re-checks the local runner before taking another job.
+        state.workerPausing = true;
+        state.workerScanning = false;
         const until = Date.now() + step.delayMs;
         while (Date.now() < until && !state.workerStop) {
-          await delay(Math.min(1000, until - Date.now()));
+          await delay(Math.min(1000, Math.max(0, until - Date.now())));
         }
-        if (state.workerStop) break;
+        pauseDone = true;
+        if (state.workerStop || state.loopAlive || state.launching || state.workerScanning) {
+          releaseScanning = !state.workerScanning;
+          return;
+        }
+        state.workerScanning = true;
+        state.workerPausing = false;
+        continue;
       }
+      pauseDone = false;
       const outcome = await runOneWorkerJob();
       if (outcome === "completed" || outcome === "failed" || outcome === "blocked" || outcome === "released") {
         ranJob = true;
@@ -1944,7 +1988,8 @@ async function drainWorkerQueue() {
       break;
     }
   } finally {
-    state.workerScanning = false;
+    if (releaseScanning) state.workerScanning = false;
+    state.workerPausing = false;
   }
 }
 

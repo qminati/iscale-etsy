@@ -10,7 +10,7 @@ import {
 } from "../src/core/worker-auth.js";
 import { createWorkerClient } from "../src/core/worker-client.js";
 import { normalizeWorkerSettings, redactWorkerCredentials } from "../src/core/worker-config.js";
-import { realtimeJoinMessage } from "../src/core/worker-realtime.js";
+import { realtimeAccessTokenMessage, realtimeJoinMessage } from "../src/core/worker-realtime.js";
 
 function jwt(payload) {
   const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
@@ -203,5 +203,34 @@ describe("settings redaction", () => {
     expect(joined.payload.access_token).toBe("user-access-token");
     expect(realtimeJoinMessage("1", publishable).payload.access_token).toBeUndefined();
     expect(realtimeJoinMessage("1", secret).payload.access_token).toBeUndefined();
+    const refreshed = realtimeAccessTokenMessage("2", "user-access-token");
+    expect(refreshed).toMatchObject({
+      topic: "realtime:etsy_worker:jobs",
+      event: "access_token",
+      payload: { access_token: "user-access-token" },
+      ref: "2",
+    });
+    expect(realtimeAccessTokenMessage("3", publishable).payload.access_token).toBeUndefined();
+    expect(realtimeAccessTokenMessage("3", secret).payload.access_token).toBeUndefined();
+  });
+
+  it("asks the lane-safe whoami RPC from the options health client", async () => {
+    const seen = [];
+    const client = createWorkerClient({
+      backendUrl: "https://example.test",
+      anonKey: "k",
+      accessToken: "user-access-token",
+      fetchImpl: async (url) => {
+        seen.push(String(url));
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ ok: true, role: "lane", lane_name: "lane-1", server_time: "2026-09-25T00:00:00.000Z" }),
+        };
+      },
+    });
+    const who = await client.laneWhoami();
+    expect(who).toMatchObject({ ok: true, role: "lane", lane_name: "lane-1" });
+    expect(seen[0]).toContain("/rpc/etsy_worker_lane_whoami");
   });
 });

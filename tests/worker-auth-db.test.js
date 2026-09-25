@@ -74,7 +74,11 @@ describe("operator auth", () => {
     });
 
     await setUid(db, LANE_ID);
-    const claim = await call("select etsy_worker_claim_job($1::text, $2::int) as result", ["lane-auth", 180]);
+    expect(await call("select etsy_worker_claim_job($1::text, $2::int) as result", ["lane-auth", 180])).toMatchObject({
+      ok: false,
+      error: "lane_mismatch",
+    });
+    const claim = await call("select etsy_worker_claim_job($1::text, $2::int) as result", ["lane-1", 180]);
     expect(claim.ok).toBe(true);
     expect(claim.job.term).toBeTruthy();
     await setUid(db, ADMIN_ID);

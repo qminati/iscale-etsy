@@ -43,7 +43,7 @@ export function parseShopPage(doc, href, nowIso) {
   return {
     shop,
     page,
-    block: detectSearchBlock(doc),
+    block: detectSearchBlock(doc, href),
     payload: {
       ...parsed,
       keyword: shop,

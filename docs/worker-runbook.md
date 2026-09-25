@@ -15,32 +15,57 @@ paste its publishable key into the options page and into your shell.
    (PostgREST plus optional Realtime). Any Postgres that can expose the
    `public.etsy_worker_*` functions over HTTP will also work with the CLI if
    you put a compatible `/rest/v1/rpc` endpoint in `ETSY_WORKER_URL`.
-2. Run all three migration files, in order, in the SQL editor or with `psql`:
+2. Read the preflight, then apply the three migrations. Do not commit the
+   project URL or keys. The second file is the command channel (`type`,
+   params, and payload snapshots). The third file is authorization: it
+   revokes the public RPCs from `anon` and `public`, grants them only to
+   `authenticated`, and requires a row in `etsy_worker.operators`.
+
+   ```bash
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/preflight-etsy-worker.sql
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/apply-etsy-worker.sql
+   ```
+
+   ```powershell
+   psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f supabase/preflight-etsy-worker.sql
+   psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f supabase/apply-etsy-worker.sql
+   ```
+
+   The apply script runs
    [supabase/migrations/20260925120000_etsy_worker.sql](../supabase/migrations/20260925120000_etsy_worker.sql),
    then [supabase/migrations/20260925140000_etsy_worker_commands.sql](../supabase/migrations/20260925140000_etsy_worker_commands.sql),
    then [supabase/migrations/20260925160000_etsy_worker_auth.sql](../supabase/migrations/20260925160000_etsy_worker_auth.sql).
-   Do not commit the project URL or keys. The second file is the command
-   channel (`type`, params, and payload snapshots). The third file is
-   authorization: it revokes the public RPCs from `anon` and `public`, grants
-   them only to `authenticated`, and requires a row in `etsy_worker.operators`.
+   Each file is one transaction. Running the apply script again after that
+   is a no-op. The SQL editor does not accept the apply script's `\ir`
+   lines; paste the three migration files there, in that order. Do not
+   re-run the first or second file after the third has created
+   `etsy_worker.operators`; those two files abort if that table exists.
+   The third file is safe to run again.
 3. If you are on Supabase, the first migration adds `etsy_worker.jobs` to the
    `supabase_realtime` publication when that publication exists. That lets an
    idle lane wake as soon as a term is inserted. Polling still picks the term
    up within about two minutes when Realtime is unavailable.
-4. In Authentication settings, disable public signups. Create one Auth user
-   per lane and one more user for the agents that enqueue work. In the SQL
-   editor, insert an operator row for each user (replace the UUIDs with the
-   ids from Authentication → Users):
+4. The operators table is the access gate. This project can keep public
+   signups enabled, because other apps share the same Auth project. A user
+   who can sign up still cannot call these RPCs until they have an operator
+   row. Create one Auth user per lane and one more user for the agents that
+   enqueue work. In the SQL editor, insert an operator row for each user
+   (replace the UUIDs with the ids from Authentication → Users). `lane_name`
+   is required for a lane and must be null for an agent or admin:
 
    ```sql
-   insert into etsy_worker.operators (user_id, role) values
-     ('<lane-user-uuid>', 'lane'),
-     ('<agent-user-uuid>', 'agent');
+   insert into etsy_worker.operators (user_id, role, lane_name) values
+     ('<lane-user-uuid>', 'lane', 'lane-1'),
+     ('<agent-user-uuid>', 'agent', null);
    ```
 
-   `lane` can claim, heartbeat, upload, complete, and fail. `agent` can
-   enqueue, add terms, search now, and read results and health. `admin` can
-   do both. A user with no operator row cannot call the RPCs.
+   `lane` can claim, heartbeat, upload, complete, and fail, and only for the
+   `lane_name` on that row. `agent` can enqueue, add terms, search now, and
+   read results and health. `admin` can do both and is not tied to one lane.
+   A user with no operator row cannot call the RPCs. The options-page Health
+   button calls `etsy_worker_lane_whoami`, which a lane user can run. The
+   CLI `health` command calls `etsy_worker_health` and needs an agent or
+   admin.
 5. Copy the project URL (`https://YOUR_PROJECT.supabase.co`) and the
    publishable key (`sb_publishable_...`) or the legacy anon JWT. That value
    is the `apikey` header only. It is not a bearer token. Do not paste a
@@ -59,9 +84,15 @@ On each machine that will scrape:
    extension's Options page).
 3. Set the backend URL, the publishable or anon key, the lane email and
    password, and a lane name unique to that window (`lane-1`, `lane-2`, …).
-   The password is sent once to sign in and is not stored. The refresh token
-   stays in `chrome.storage.local`. Content scripts cannot read the key or
-   the tokens.
+   The password is sent once to sign in and is not stored. The access token
+   and the refresh token stay in `chrome.storage.session`, with
+   `setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" })`. Content scripts
+   cannot read that store. They can read `chrome.storage.local`, so the
+   tokens are not kept there. Closing Chrome clears the session; open the
+   options page and save the password again to sign in. The hourly job
+   counter stays in `chrome.storage.local` under `etsyWorkerClaimTimes` and
+   survives a restart. The publishable key in extension settings is redacted
+   before a content script can read settings.
 4. Leave the defaults unless you need to change them: poll 20 seconds, claim
    lease 180 seconds, 4–9 seconds between results pages, 20–60 seconds
    between jobs, 30 jobs per hour, a heartbeat every 30 seconds, 40–140 ms
@@ -235,14 +266,16 @@ console line is `[etsy-worker] search path: ...`.
 ## End-to-end smoke test
 
 The commands below need a real backend and a visible Chrome window. They are
-not part of CI. `npm test` does load the unpacked extension in Chrome for
-Testing (`tests/extension-smoke.test.js`) against a static fixture page and
-checks that the content script answers `worker.detectBlock` and
-`search.scrollAndExtract`. Branded Chrome 137 and later ignores
+not part of CI. `npm test` does not download Chrome. The unpacked-extension
+check is opt-in: `npm run test:e2e` sets `ETSY_E2E_CHROME=1` and runs
+`tests/extension-smoke.test.js` in Chrome for Testing against a static
+fixture page. It checks that the content script answers `worker.detectBlock`
+and `search.scrollAndExtract`. Branded Chrome 137 and later ignores
 `--load-extension`, so that test uses Chrome for Testing.
 
-1. Apply all three migrations. Disable public signups, create the lane user
-   and the agent user, and insert their `etsy_worker.operators` rows. In the
+1. Run the preflight and apply commands above. Create the lane user and the
+   agent user, and insert their `etsy_worker.operators` rows, including
+   `lane_name` for the lane. In the
    extension options, set the backend URL, the publishable or anon key, the
    lane email and password, and the lane name, then enable worker mode and
    save. That save signs the lane in. Leave the window visible. In the shell,

@@ -3,10 +3,10 @@
 -- Apply this file yourself in a Postgres / Supabase SQL editor. Nothing in this
 -- repository connects to a database or ships a project URL or key.
 --
--- The anon (publishable) key can call the RPCs below. Treat that key as a
--- credential: anyone who has it can add terms and read results. Do not commit
--- it. Direct table writes stay closed; listings are inserted only through
--- etsy_worker_upload_results, which checks the claim lease.
+-- The grants at the bottom of this file allow anon. Migration
+-- 20260925160000_etsy_worker_auth.sql replaces them with operator checks.
+-- Do not run this file again after that migration: it aborts if
+-- etsy_worker.operators already exists.
 --
 -- Realtime: when the supabase_realtime publication exists, etsy_worker.jobs is
 -- added so an idle lane can wake on a new pending term. Polling still works
@@ -22,6 +22,17 @@ begin
   end if;
   if not exists (select 1 from pg_roles where rolname = 'service_role') then
     create role service_role nologin bypassrls;
+  end if;
+end $$;
+
+-- CREATE ROLE cannot run inside a transaction. Everything after it can, so a
+-- partial apply under psql -f or the Supabase SQL endpoint rolls back.
+begin;
+
+do $$
+begin
+  if to_regclass('etsy_worker.operators') is not null then
+    raise exception 'Refusing to re-apply 20260925120000_etsy_worker.sql because etsy_worker.operators already exists. Re-running it would grant anon and replace the auth wrappers.';
   end if;
 end $$;
 
@@ -1054,3 +1065,5 @@ exception
   when undefined_table then
     null;
 end $$;
+
+commit;

@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.2.2 — Shared-database migration safety
+
+- The auth migration moves only the 17 known `etsy_worker_*` functions.
+  A `LIKE` pattern is escaped and still intersected with that list, so a
+  lookalike name in `public` stays where it is.
+- The first two migrations abort if `etsy_worker.operators` already exists.
+  The auth migration is safe to run again and does not drop its own checks.
+  Each migration file is one transaction.
+  `supabase/preflight-etsy-worker.sql` is read-only.
+  `supabase/apply-etsy-worker.sql` applies all three and does nothing when
+  they are already in place.
+- Lane users are bound to `operators.lane_name`. Claim, heartbeat, upload,
+  complete, and fail reject a different lane. Complete, fail, and upload
+  still require the job's current lease. There is no `etsy_worker.authed`
+  session bypass. `upload_results` refuses a call with more than 500 rows.
+- The options Health button calls `etsy_worker_lane_whoami`. Access and
+  refresh tokens stay in `chrome.storage.session` (`TRUSTED_CONTEXTS`) and
+  are removed from `chrome.storage.local`. The hourly cap counter stays in
+  local storage. Realtime sends a new access token when the session
+  refreshes. A shop or listing page with no cards is not treated as a
+  blocked search. The between-jobs pause releases the worker busy flag.
+  `npm run test:e2e` is the Chrome smoke test; `npm test` does not download
+  Chrome.
+
 ## 1.2.1 — Worker review fixes
 
 - Content scripts are classic scripts again. Shared parsers ship as committed

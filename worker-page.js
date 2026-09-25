@@ -31,7 +31,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.action === "worker.detectBlock") {
-    sendResponse({ block: detectSearchBlock(document) });
+    sendResponse({ block: detectSearchBlock(document, location.href) });
     return true;
   }
   if (message?.action === "worker.extractShop") {

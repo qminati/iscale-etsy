@@ -114,9 +114,23 @@ describe("detectSearchBlock", () => {
     expect(detectSearchBlock(doc)).toEqual({ blocked: true, reason: "captcha", noResults: false });
   });
 
-  it("treats zero listings without an empty-state marker as suspicious", () => {
+  it("treats zero listings without an empty-state marker as suspicious on a search page only", () => {
     const doc = setBody(`<h1>Search</h1><p>Please wait</p>`);
-    expect(detectSearchBlock(doc)).toEqual({ blocked: true, reason: "suspicious_empty", noResults: false });
+    expect(detectSearchBlock(doc, "https://www.etsy.com/search?q=linen")).toEqual({
+      blocked: true,
+      reason: "suspicious_empty",
+      noResults: false,
+    });
+    expect(detectSearchBlock(doc, "https://www.etsy.com/shop/CoolShop")).toEqual({
+      blocked: false,
+      reason: null,
+      noResults: false,
+    });
+    expect(detectSearchBlock(doc, "https://www.etsy.com/listing/1234567890/linen-apron")).toEqual({
+      blocked: false,
+      reason: null,
+      noResults: false,
+    });
   });
 });
 

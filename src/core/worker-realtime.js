@@ -38,6 +38,18 @@ export function realtimeJoinMessage(ref = "1", accessToken = "") {
   };
 }
 
+export function realtimeAccessTokenMessage(ref = "1", accessToken = "") {
+  const token = String(accessToken || "");
+  return {
+    topic: "realtime:etsy_worker:jobs",
+    event: "access_token",
+    payload: token && !token.startsWith("sb_publishable_") && !token.startsWith("sb_secret_")
+      ? { access_token: token }
+      : {},
+    ref: String(ref),
+  };
+}
+
 export function realtimeHeartbeatMessage(ref = "hb") {
   return { topic: "phoenix", event: "heartbeat", payload: {}, ref: String(ref) };
 }

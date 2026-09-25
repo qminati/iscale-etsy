@@ -1,6 +1,6 @@
 {
   "name": "iscale-etsy",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "engines": {
     "node": ">=18"
   },
@@ -11,6 +11,7 @@
   "author": "iScaleLabs",
   "scripts": {
     "test": "vitest run tests",
+    "test:e2e": "node scripts/run-extension-smoke.mjs",
     "lint": "eslint \"**/*.js\"",
     "package": "node scripts/package.mjs",
     "worker": "node scripts/etsy-worker.mjs",
