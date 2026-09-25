@@ -186,12 +186,32 @@ between visits, and stop when a captcha appears. Export and collection stats
 read that browser's local data and upload a snapshot. Rows land as each page
 finishes, not only at the end of the job.
 
-Nothing in the extension or the CLI is a backend URL or key. You set those in
-the extension's options and in `ETSY_WORKER_URL` / `ETSY_WORKER_ANON_KEY`.
+Nothing in the extension or the CLI is a backend URL or key. You set the
+project URL and the publishable or anon key, then sign in with an operator
+email and password. The key is the `apikey` header. The bearer token is the
+signed-in user's access token. A `service_role` or `sb_secret_` key is rejected.
 
 ```bash
 export ETSY_WORKER_URL="https://YOUR_PROJECT.supabase.co"
-export ETSY_WORKER_ANON_KEY="your-publishable-anon-key"
+export ETSY_WORKER_ANON_KEY="your-publishable-or-anon-key"
+export ETSY_WORKER_EMAIL="agent@example.com"
+export ETSY_WORKER_PASSWORD="the-agent-password"
+
+npm run worker -- add-terms "linen apron" --priority 10 --pages 2
+npm run worker -- status --term "linen apron"
+npm run worker -- results --term "linen apron" --json
+npm run worker -- search-now "rush term" --pages 1
+npm run worker -- scrape-listings --url "https://www.etsy.com/listing/1234567890"
+npm run worker -- scrape-shop --shop CoolShop --pages 1
+npm run worker -- export --source shop --format csv
+npm run worker -- stats
+```
+
+```powershell
+$env:ETSY_WORKER_URL = "https://YOUR_PROJECT.supabase.co"
+$env:ETSY_WORKER_ANON_KEY = "your-publishable-or-anon-key"
+$env:ETSY_WORKER_EMAIL = "agent@example.com"
+$env:ETSY_WORKER_PASSWORD = "the-agent-password"
 
 npm run worker -- add-terms "linen apron" --priority 10 --pages 2
 npm run worker -- status --term "linen apron"

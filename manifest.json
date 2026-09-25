@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "iScale Etsy",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Local-first Etsy research scraper v5 with manual collection, batch jobs, Shop View, and CSV export.",
   "permissions": ["alarms", "downloads", "sidePanel", "storage"],
   "optional_host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
@@ -38,15 +38,18 @@
   "content_scripts": [
     {
       "matches": ["https://*.etsy.com/*"],
-      "js": ["worker-page.js"],
-      "run_at": "document_idle",
-      "type": "module"
+      "js": [
+        "src/content/search-results.classic.js",
+        "src/content/search-box.classic.js",
+        "src/content/shop-page.classic.js",
+        "worker-page.js"
+      ],
+      "run_at": "document_idle"
     },
     {
       "matches": ["https://*.etsy.com/search*"],
-      "js": ["content.js"],
-      "run_at": "document_end",
-      "type": "module"
+      "js": ["src/content/search-results.classic.js", "content.js"],
+      "run_at": "document_end"
     },
     {
       "matches": ["https://*.etsy.com/listing/*"],

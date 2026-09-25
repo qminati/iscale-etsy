@@ -1,12 +1,8 @@
 // @vitest-environment node
-import { readdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { PGlite } from "@electric-sql/pglite";
 import { beforeAll, describe, expect, it } from "vitest";
 import { JOB_TYPES } from "../src/core/worker-commands.js";
+import { createWorkerDb } from "./helpers/worker-db.js";
 
-const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "../supabase/migrations");
 let db;
 
 function json(value) {
@@ -20,11 +16,7 @@ async function call(statement, params = []) {
 }
 
 beforeAll(async () => {
-  db = new PGlite();
-  const files = readdirSync(migrationsDir).filter((name) => name.endsWith(".sql")).sort();
-  for (const name of files) {
-    await db.exec(readFileSync(join(migrationsDir, name), "utf8"));
-  }
+  db = await createWorkerDb();
 }, 60000);
 
 describe("etsy worker command channel", () => {

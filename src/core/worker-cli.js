@@ -1,7 +1,11 @@
 // Agent-facing commands for the optional Etsy worker queue.
-// Reads ETSY_WORKER_URL and ETSY_WORKER_ANON_KEY from the environment.
-// Never prints the key.
+// Reads the backend URL, publishable or anon key, and an Auth user from the
+// environment. Never prints the key, password, or access token.
 
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { classifyApiKey, ensureWorkerSession } from "./worker-auth.js";
 import { createWorkerClient } from "./worker-client.js";
 import { collectListingUrls, normalizeExportParams } from "./worker-commands.js";
 import { parseShopTarget } from "./shop-page.js";
@@ -10,7 +14,11 @@ export const CLI_HELP = `etsy-worker — queue extension commands for a visible 
 
 Environment (required, never commit these):
   ETSY_WORKER_URL        https://YOUR_PROJECT.supabase.co
-  ETSY_WORKER_ANON_KEY   publishable anon key
+  ETSY_WORKER_ANON_KEY   publishable (sb_publishable_...) or legacy anon key
+  ETSY_WORKER_EMAIL      Auth user email (agent or admin)
+  ETSY_WORKER_PASSWORD   Auth user password
+  ETSY_WORKER_TOKEN_CACHE  optional token file outside this repo
+                         (default: ~/.config/iscale-etsy/worker-token.json)
 
 Commands:
   add-terms "<term>" ["<term>" ...] --priority <n> [--pages <n>] [--sort <order>]
@@ -101,13 +109,71 @@ function termList(parsed) {
   return terms.map((term) => String(term).trim()).filter(Boolean);
 }
 
-function clientFromEnv(env, fetchImpl) {
+export function defaultTokenCachePath() {
+  return resolve(homedir(), ".config", "iscale-etsy", "worker-token.json");
+}
+
+export function tokenCachePath(env = {}, cwd = process.cwd()) {
+  const requested = String(env.ETSY_WORKER_TOKEN_CACHE || "").trim();
+  const file = requested ? (isAbsolute(requested) ? requested : resolve(cwd, requested)) : defaultTokenCachePath();
+  const root = resolve(cwd);
+  const rel = relative(root, file);
+  if (rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))) {
+    throw new Error("ETSY_WORKER_TOKEN_CACHE must point outside the repository.");
+  }
+  return file;
+}
+
+async function readTokenCache(file) {
+  try {
+    const parsed = JSON.parse(await readFile(file, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeTokenCache(file, session) {
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresAt: session.expiresAt,
+  })}\n`, { mode: 0o600 });
+}
+
+async function clientFromEnv(env, fetchImpl) {
   const backendUrl = String(env.ETSY_WORKER_URL || "").trim();
   const anonKey = String(env.ETSY_WORKER_ANON_KEY || "").trim();
+  const email = String(env.ETSY_WORKER_EMAIL || "").trim();
+  const password = String(env.ETSY_WORKER_PASSWORD || "");
   if (!backendUrl || !anonKey) {
     throw new Error("Set ETSY_WORKER_URL and ETSY_WORKER_ANON_KEY. Do not commit them.");
   }
-  return createWorkerClient({ fetchImpl, backendUrl, anonKey });
+  const key = classifyApiKey(anonKey);
+  if (!key.ok) {
+    throw new Error(key.error === "service_role_rejected" || key.error === "secret_key_rejected"
+      ? "Refusing a service_role or sb_secret_ key. Use the publishable or anon key."
+      : key.error);
+  }
+  const cacheFile = tokenCachePath(env);
+  const stored = await readTokenCache(cacheFile);
+  const session = await ensureWorkerSession({
+    fetchImpl,
+    backendUrl,
+    apiKey: anonKey,
+    email,
+    password,
+    stored,
+  });
+  if (!session.ok) {
+    if (!email || !password) {
+      throw new Error("Set ETSY_WORKER_EMAIL and ETSY_WORKER_PASSWORD, or a token cache from an earlier sign-in.");
+    }
+    throw new Error(session.error || "sign_in_failed");
+  }
+  if (session.refreshed) await writeTokenCache(cacheFile, session);
+  return createWorkerClient({ fetchImpl, backendUrl, anonKey, accessToken: session.accessToken });
 }
 
 const ENQUEUE_COMMANDS = new Set(["enqueue", "scrape-listings", "scrape-shop", "export", "stats"]);
@@ -191,21 +257,34 @@ export async function runWorkerCli(argv, env = {}, fetchImpl = globalThis.fetch,
     return parsed.command === "help" || parsed.flags.help ? 0 : 2;
   }
 
-  let client;
   try {
-    client = clientFromEnv(env, fetchImpl);
-  } catch (error) {
-    out.error(error.message);
-    return 1;
-  }
-
-  try {
-    if (parsed.command === "add-terms") {
-      const terms = termList(parsed);
-      if (terms.length === 0) {
-        out.error('usage: add-terms "<term>" --priority <n>');
+    if (parsed.command === "add-terms" && termList(parsed).length === 0) {
+      out.error('usage: add-terms "<term>" --priority <n>');
+      return 2;
+    }
+    if (parsed.command === "search-now" && termList(parsed).length !== 1) {
+      out.error('usage: search-now "<term>" [--pages <n>]');
+      return 2;
+    }
+    let enqueueRequest = null;
+    if (ENQUEUE_COMMANDS.has(parsed.command)) {
+      enqueueRequest = buildEnqueue(parsed);
+      if (enqueueRequest.error) {
+        out.error(enqueueRequest.error);
         return 2;
       }
+    }
+
+    let client;
+    try {
+      client = await clientFromEnv(env, fetchImpl);
+    } catch (error) {
+      out.error(error.message);
+      return 1;
+    }
+
+    if (parsed.command === "add-terms") {
+      const terms = termList(parsed);
       const priority = intFlag(parsed.flags.priority, 0);
       const pages = intFlag(parsed.flags.pages, 1);
       const sort = parsed.flags.sort || "most_relevant";
@@ -225,10 +304,6 @@ export async function runWorkerCli(argv, env = {}, fetchImpl = globalThis.fetch,
 
     if (parsed.command === "search-now") {
       const terms = termList(parsed);
-      if (terms.length !== 1) {
-        out.error('usage: search-now "<term>" [--pages <n>]');
-        return 2;
-      }
       const data = await client.searchNow(terms[0], intFlag(parsed.flags.pages, 1), parsed.flags.sort || "most_relevant");
       if (data?.ok === false) {
         out.error(data.error || "search_now_failed");
@@ -240,12 +315,7 @@ export async function runWorkerCli(argv, env = {}, fetchImpl = globalThis.fetch,
     }
 
     if (ENQUEUE_COMMANDS.has(parsed.command)) {
-      const request = buildEnqueue(parsed);
-      if (request.error) {
-        out.error(request.error);
-        return 2;
-      }
-      const data = await client.enqueue(request.type, request.params, request.priority);
+      const data = await client.enqueue(enqueueRequest.type, enqueueRequest.params, enqueueRequest.priority);
       if (data?.ok === false) {
         out.error(data.error || "enqueue_failed");
         return 1;

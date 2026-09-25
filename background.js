@@ -13,10 +13,11 @@ import { mergeSearchResult, searchResultKey, SEARCH_EXPORT_COLUMNS } from "./src
 import { aggregateSession, blankSessionTally, foldSessionUrl } from "./src/core/session.js";
 import { createKeyedQueue } from "./src/core/serialize.js";
 import { authorizeMessageSender } from "./src/core/message-auth.js";
-import { LANE_SESSION_KEY, normalizeWorkerSettings, sanitizeLaneSnapshot, workerAlarmDelayMinutes } from "./src/core/worker-config.js";
+import { LANE_SESSION_KEY, normalizeWorkerSettings, redactWorkerCredentials, sanitizeLaneSnapshot, workerAlarmDelayMinutes } from "./src/core/worker-config.js";
 import { createWorkerClient } from "./src/core/worker-client.js";
+import { ensureWorkerSession, signInWithPassword } from "./src/core/worker-auth.js";
 import { isEtsySearchForTerm } from "./src/core/search-box.js";
-import { decideWorkerTick } from "./src/core/worker-loop.js";
+import { decideWorkerTick, interpretBlockReply, planDrainStep, workerTabReusable } from "./src/core/worker-loop.js";
 import { runWorkerJob, shapeExport, shapeStats } from "./src/core/worker-commands.js";
 import { isPendingJobWake, parseRealtimeMessage, realtimeHeartbeatMessage, realtimeJoinMessage, realtimeWebSocketUrl } from "./src/core/worker-realtime.js";
 
@@ -48,7 +49,7 @@ const state = {
 // sets loopAlive synchronously, so the slot stays held continuously once a loop
 // actually starts.
 function claimRunner() {
-  if (state.loopAlive || state.launching) return false;
+  if (state.loopAlive || state.launching || state.workerScanning) return false;
   state.launching = true;
   // Clear stop/pause intent synchronously at claim time (NOT in launchJob). A genuine
   // Stop/Pause arriving DURING the claim→launch awaits then re-sets the flag, and
@@ -74,7 +75,12 @@ const settingsQueue = createKeyedQueue();
 // (audit deep-pass Low — concurrent saveSettings lost-update)
 function saveSettings(value) {
   return settingsQueue("settings", async () => {
-    const next = { ...(await getSettings()), ...value };
+    const incoming = { ...(value || {}) };
+    delete incoming.workerPassword;
+    delete incoming.workerAccessToken;
+    delete incoming.workerRefreshToken;
+    delete incoming.workerSignedIn;
+    const next = { ...(await getSettings()), ...incoming };
     await putRecord("settings", { id: SETTINGS_ID, value: next });
     state.settings = next;
     if (
@@ -347,6 +353,28 @@ async function handleMessage(message, sender) {
   // passive save computes its total off a wrong base.
   if (message.action === "worker.health") return workerHealth();
   if (message.action === "worker.session") return readLaneSession();
+  if (message.action === "worker.signIn") {
+    const cfg = workerConfig({ ...(await getSettings()), ...(message.input?.email ? { workerEmail: message.input.email } : {}) });
+    const email = String(message.input?.email || cfg.email || "").trim();
+    const password = String(message.input?.password || "");
+    const signed = await signInWithPassword({
+      fetchImpl: fetch,
+      backendUrl: cfg.backendUrl,
+      apiKey: cfg.anonKey,
+      email,
+      password,
+    });
+    if (!signed.ok) return signed;
+    await writeWorkerAuth({ ...signed, email });
+    if (email) await saveSettings({ workerEmail: email });
+    return { signedIn: true };
+  }
+  if (message.action === "settings.get") {
+    const settings = await getSettings();
+    if (sender?.tab) return redactWorkerCredentials(settings);
+    const auth = await readWorkerAuth();
+    return { ...settings, workerSignedIn: Boolean(auth?.accessToken) };
+  }
 
   if (message.action === "collection.refresh") {
     await refreshBadge();
@@ -1550,9 +1578,16 @@ const WORKER_SETTING_KEYS = [
   "workerKeystrokeMinMs",
   "workerKeystrokeMaxMs",
   "workerBlockBackoffMin",
+  "workerBetweenJobsMinMs",
+  "workerBetweenJobsMaxMs",
+  "workerJobsPerHour",
+  "workerEmail",
   "workerRealtime",
   "workerBlockedUntil",
 ];
+
+const WORKER_AUTH_KEY = "etsyWorkerAuth";
+const WORKER_CLAIM_TIMES_KEY = "etsyWorkerClaimTimes";
 
 function workerConfig(settings) {
   return normalizeWorkerSettings(settings || {});
@@ -1578,11 +1613,66 @@ async function writeLaneSession(partial) {
   }
 }
 
+async function readWorkerAuth() {
+  try {
+    const stored = await chrome.storage.local.get(WORKER_AUTH_KEY);
+    return stored?.[WORKER_AUTH_KEY] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeWorkerAuth(session) {
+  const next = {
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresAt: session.expiresAt,
+    email: session.email || "",
+  };
+  await chrome.storage.local.set({ [WORKER_AUTH_KEY]: next });
+  return next;
+}
+
+async function ensureWorkerAccess(cfg, password = "") {
+  const stored = await readWorkerAuth();
+  const session = await ensureWorkerSession({
+    fetchImpl: fetch,
+    backendUrl: cfg.backendUrl,
+    apiKey: cfg.anonKey,
+    email: cfg.email,
+    password,
+    stored,
+  });
+  if (!session.ok) return session;
+  if (session.refreshed || !stored?.accessToken) await writeWorkerAuth({ ...session, email: cfg.email });
+  return session;
+}
+
+async function openWorkerClient(cfg) {
+  const session = await ensureWorkerAccess(cfg);
+  if (!session.ok) return { ok: false, error: session.error || "sign_in_required" };
+  return {
+    ok: true,
+    accessToken: session.accessToken,
+    client: createWorkerClient({
+      fetchImpl: fetch,
+      backendUrl: cfg.backendUrl,
+      anonKey: cfg.anonKey,
+      getAccessToken: async () => {
+        const fresh = await ensureWorkerAccess(cfg);
+        if (!fresh.ok) throw new Error(fresh.error || "sign_in_required");
+        return fresh.accessToken;
+      },
+    }),
+  };
+}
+
 async function workerHealth() {
   const cfg = workerConfig(await getSettings());
   if (!cfg.ready) return { ok: false, error: cfg.configError || "worker_not_configured" };
-  const client = createWorkerClient({ fetchImpl: fetch, backendUrl: cfg.backendUrl, anonKey: cfg.anonKey });
-  return client.health();
+  const opened = await openWorkerClient(cfg);
+  if (!opened.ok) return opened;
+  return opened.client.health();
 }
 
 function closeWorkerRealtime() {
@@ -1598,10 +1688,12 @@ function closeWorkerRealtime() {
   state.workerSocket = null;
 }
 
-function openWorkerRealtime(cfg) {
+async function openWorkerRealtime(cfg) {
   if (!cfg.realtime || !cfg.ready) return;
   if (state.workerSocket && state.workerSocket.readyState <= 1) return;
   closeWorkerRealtime();
+  const session = await ensureWorkerAccess(cfg);
+  if (!session.ok) return;
   let url;
   try {
     url = realtimeWebSocketUrl(cfg.backendUrl, cfg.anonKey);
@@ -1616,9 +1708,10 @@ function openWorkerRealtime(cfg) {
   }
   state.workerSocket = ws;
   const ref = { n: 1 };
+  const accessToken = session.accessToken;
   ws.onopen = () => {
     try {
-      ws.send(JSON.stringify(realtimeJoinMessage(String(ref.n++))));
+      ws.send(JSON.stringify(realtimeJoinMessage(String(ref.n++), accessToken)));
     } catch {
       // polling still wakes the lane
     }
@@ -1667,10 +1760,11 @@ async function ensureWorkerScheduled(settings) {
     return;
   }
   try {
-    await chrome.alarms.create(WORKER_POLL_ALARM, { delayInMinutes: workerAlarmDelayMinutes(cfg.pollSeconds) });
+    await chrome.alarms.create(WORKER_POLL_ALARM, { periodInMinutes: workerAlarmDelayMinutes(cfg.pollSeconds) });
   } catch {
     // unpacked alarms can still fail in tests that mock chrome poorly
   }
+  await validateSavedWorkerTab();
   if (cfg.ready && cfg.realtime) openWorkerRealtime(cfg);
   else closeWorkerRealtime();
   if (!state.workerScanning) {
@@ -1710,12 +1804,58 @@ function isEtsyPage(url) {
   }
 }
 
+async function validateSavedWorkerTab() {
+  const settings = await getSettings();
+  const candidates = runnerTabCandidates(state.workerTabId, settings.workerTabId);
+  for (const tabId of candidates) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (workerTabReusable(tab, state.tabId)) {
+        state.workerTabId = tab.id;
+        return tab;
+      }
+    } catch {
+      // closed while the service worker slept
+    }
+  }
+  if (state.workerTabId || settings.workerTabId) {
+    state.workerTabId = null;
+    await saveSettings({ workerTabId: null });
+  }
+  return null;
+}
+
+async function readClaimTimes(now = Date.now()) {
+  const recent = (times) => (Array.isArray(times) ? times : []).filter((stamp) => {
+    const age = now - Number(stamp);
+    return Number.isFinite(age) && age >= 0 && age < 60 * 60 * 1000;
+  });
+  try {
+    const stored = await chrome.storage.session.get(WORKER_CLAIM_TIMES_KEY);
+    return recent(stored?.[WORKER_CLAIM_TIMES_KEY]);
+  } catch {
+    return recent(state.workerClaimTimes);
+  }
+}
+
+async function rememberClaim(now = Date.now()) {
+  const times = [...(await readClaimTimes(now)), now].filter((stamp) => now - Number(stamp) < 60 * 60 * 1000);
+  state.workerClaimTimes = times;
+  try {
+    await chrome.storage.session.set({ [WORKER_CLAIM_TIMES_KEY]: times });
+  } catch {
+    // the in-memory list still caps this service-worker lifetime
+  }
+  return times;
+}
+
 async function getOrCreateWorkerTab() {
   const settings = await getSettings();
   const candidates = runnerTabCandidates(state.workerTabId, settings.workerTabId).filter((id) => id !== state.tabId);
   for (const tabId of candidates) {
     try {
       const tab = await chrome.tabs.get(tabId);
+      if (!workerTabReusable(tab, state.tabId)) continue;
       state.workerTabId = tab.id;
       if (settings.workerTabId !== tab.id) await saveSettings({ workerTabId: tab.id });
       await showWorkerTab(tab);
@@ -1764,25 +1904,47 @@ function waitForTabUrl(tabId, predicate, timeoutMs) {
 }
 
 async function drainWorkerQueue() {
-  if (state.workerScanning) return;
+  if (state.workerScanning || state.loopAlive || state.launching) return;
   state.workerScanning = true;
+  let ranJob = false;
   try {
     while (!state.workerStop) {
+      const settings = await getSettings();
+      const cfg = workerConfig(settings);
+      const step = planDrainStep({
+        ranJob,
+        claimTimes: await readClaimTimes(),
+        nowMs: Date.now(),
+        cap: cfg.jobsPerHour,
+        cfg,
+      });
+      if (step.action === "hourly_cap") {
+        await writeLaneSession({
+          status: "idle",
+          phase: "hourly_cap",
+          laneName: cfg.laneName,
+          lastError: "jobs_per_hour",
+          backendHost: cfg.origin,
+        });
+        break;
+      }
+      if (step.action === "pause") {
+        const until = Date.now() + step.delayMs;
+        while (Date.now() < until && !state.workerStop) {
+          await delay(Math.min(1000, until - Date.now()));
+        }
+        if (state.workerStop) break;
+      }
       const outcome = await runOneWorkerJob();
-      if (outcome === "completed" || outcome === "failed") continue;
+      if (outcome === "completed" || outcome === "failed" || outcome === "blocked" || outcome === "released") {
+        ranJob = true;
+        if (state.workerStop) break;
+        continue;
+      }
       break;
     }
   } finally {
     state.workerScanning = false;
-    try {
-      const settings = await getSettings();
-      const cfg = workerConfig(settings);
-      if (cfg.enabled && !state.workerStop) {
-        await chrome.alarms.create(WORKER_POLL_ALARM, { delayInMinutes: workerAlarmDelayMinutes(cfg.pollSeconds) });
-      }
-    } catch {
-      // the next browser start reschedules from settings
-    }
   }
 }
 
@@ -1825,7 +1987,12 @@ async function runOneWorkerJob() {
   }
 
   await writeLaneSession({ status: "claiming", phase: "claim", laneName: cfg.laneName, backendHost: cfg.origin, lastError: "" });
-  const client = createWorkerClient({ fetchImpl: fetch, backendUrl: cfg.backendUrl, anonKey: cfg.anonKey });
+  const opened = await openWorkerClient(cfg);
+  if (!opened.ok) {
+    await writeLaneSession({ status: "error", phase: "auth", laneName: cfg.laneName, lastError: opened.error || "sign_in_required" });
+    return "error";
+  }
+  const client = opened.client;
   let claim;
   try {
     claim = await client.claimJob(cfg.laneName, cfg.leaseSeconds);
@@ -1851,7 +2018,16 @@ async function runOneWorkerJob() {
   }
 
   const job = claim.job;
-  const result = await runWorkerJob({ job, cfg, deps: makeWorkerDeps(client, cfg, job) });
+  await rememberClaim();
+  const heartbeat = setInterval(() => {
+    client.heartbeat(cfg.laneName, job.id, { phase: "heartbeat", jobId: job.id }, cfg.leaseSeconds).catch(() => {});
+  }, cfg.heartbeatSeconds * 1000);
+  let result;
+  try {
+    result = await runWorkerJob({ job, cfg, deps: makeWorkerDeps(client, cfg, job) });
+  } finally {
+    clearInterval(heartbeat);
+  }
   if (result.status === "blocked") {
     await saveSettings({ workerBlockedUntil: Date.now() + cfg.blockBackoffMin * 60000 });
   }
@@ -1916,16 +2092,17 @@ function makeWorkerDeps(client, cfg, job) {
     extractPage: async () => {
       await delay(randomInRange(300, 700));
       const response = await sendTabMessageRetry(tab.id, { action: "search.scrollAndExtract" });
-      if (response?.payload) {
-        try {
-          await saveSearchResults(response.payload);
-        } catch {
-          // the backend upload is the lane's record; the local copy is best-effort
-        }
+      if (!response || response.error || !response.payload) {
+        return { payload: { results: [], totalResults: null }, block: { blocked: true, reason: "unknown", noResults: false } };
+      }
+      try {
+        await saveSearchResults(response.payload);
+      } catch {
+        // the backend upload is the lane's record; the local copy is best-effort
       }
       return {
-        payload: response?.payload || { results: [], totalResults: null },
-        block: response?.block || { blocked: false },
+        payload: response.payload,
+        block: interpretBlockReply({ block: response.block }),
       };
     },
     upload: (body) => client.uploadResults({
@@ -1934,15 +2111,24 @@ function makeWorkerDeps(client, cfg, job) {
       listings: body.listings,
       page: body.page,
       totalResults: body.totalResults,
+      totalResultsRaw: body.totalResultsRaw,
       leaseSeconds: cfg.leaseSeconds,
     }),
     heartbeat: (progress) => client.heartbeat(cfg.laneName, progress.jobId || job.id, progress, cfg.leaseSeconds),
     complete: (progress) => client.completeJob(progress.jobId || job.id, cfg.laneName, progress),
-    fail: (info) => client.failJob(info.jobId || job.id, cfg.laneName, info.error, info.blocked === true),
+    fail: (info) => client.failJob(info.jobId || job.id, cfg.laneName, info.error, info.blocked === true, {
+      retryable: info.retryable === true,
+      release: info.release === true,
+    }),
+    release: (info) => client.failJob(info?.jobId || job.id, cfg.laneName, info?.error || "released", false, { release: true }),
     detectBlock: async () => {
-      tab = tab || (await getOrCreateWorkerTab());
-      const response = await sendTabMessageRetry(tab.id, { action: "worker.detectBlock" });
-      return response?.block || { blocked: false, reason: null };
+      try {
+        tab = tab || (await getOrCreateWorkerTab());
+        const response = await sendTabMessageRetry(tab.id, { action: "worker.detectBlock" });
+        return interpretBlockReply(response);
+      } catch {
+        return { blocked: true, reason: "unknown", noResults: false };
+      }
     },
     extractListing: async (input) => {
       tab = tab || (await getOrCreateWorkerTab());
@@ -1962,7 +2148,10 @@ function makeWorkerDeps(client, cfg, job) {
     extractShop: async () => {
       tab = tab || (await getOrCreateWorkerTab());
       const response = await sendTabMessageRetry(tab.id, { action: "worker.extractShop" });
-      if (response?.payload) {
+      if (!response || response.error) {
+        return { shop: "", payload: { results: [], totalResults: null }, block: { blocked: true, reason: "unknown", noResults: false } };
+      }
+      if (response.payload) {
         try {
           await saveSearchResults(response.payload);
         } catch {
@@ -1970,9 +2159,9 @@ function makeWorkerDeps(client, cfg, job) {
         }
       }
       return {
-        shop: response?.shop || "",
-        payload: response?.payload || { results: [], totalResults: null },
-        block: response?.block || { blocked: false },
+        shop: response.shop || "",
+        payload: response.payload || { results: [], totalResults: null },
+        block: interpretBlockReply(response.block ? { block: response.block } : null),
       };
     },
     uploadPayload: (body) => client.uploadPayload({

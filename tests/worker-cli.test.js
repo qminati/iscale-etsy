@@ -1,6 +1,7 @@
 // @vitest-environment node
-import { describe, expect, it } from "vitest";
-import { buildEnqueue, parseWorkerArgs, runWorkerCli } from "../src/core/worker-cli.js";
+import { rm } from "node:fs/promises";
+import { beforeEach, describe, expect, it } from "vitest";
+import { buildEnqueue, parseWorkerArgs, runWorkerCli, tokenCachePath } from "../src/core/worker-cli.js";
 import { rpcUrl } from "../src/core/worker-client.js";
 import { isPendingJobWake, realtimeJoinMessage, realtimeWebSocketUrl } from "../src/core/worker-realtime.js";
 import { idlePickupWithinSla, normalizeWorkerSettings, sanitizeLaneSnapshot } from "../src/core/worker-config.js";
@@ -30,17 +31,43 @@ describe("parseWorkerArgs", () => {
 });
 
 function fakeFetch(routes) {
-  return async (url, init) => {
+  const impl = async (url, init) => {
+    impl.calls.push({ url: String(url), init });
+    const href = String(url);
+    if (href.includes("/auth/v1/token")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          access_token: "user-access-token",
+          refresh_token: "user-refresh-token",
+          expires_in: 3600,
+        }),
+      };
+    }
     const body = JSON.parse(init.body);
     const fn = String(url).split("/").pop();
     const handler = routes[fn];
     if (!handler) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "missing" }) };
     return { ok: true, status: 200, text: async () => JSON.stringify(handler(body)) };
   };
+  impl.calls = [];
+  return impl;
 }
 
 describe("runWorkerCli", () => {
-  const env = { ETSY_WORKER_URL: "https://example.test", ETSY_WORKER_ANON_KEY: "publishable-key" };
+  const cache = "/tmp/iscale-etsy-worker-token.json";
+  const env = {
+    ETSY_WORKER_URL: "https://example.test",
+    ETSY_WORKER_ANON_KEY: "publishable-key",
+    ETSY_WORKER_EMAIL: "lane@example.test",
+    ETSY_WORKER_PASSWORD: "lane-password",
+    ETSY_WORKER_TOKEN_CACHE: cache,
+  };
+
+  beforeEach(async () => {
+    await rm(cache, { force: true });
+  });
 
   it("posts add-terms with priority and prints search-now", async () => {
     const seen = [];
@@ -59,6 +86,14 @@ describe("runWorkerCli", () => {
     expect(code).toBe(0);
     expect(seen[0]).toMatchObject({ p_terms: ["linen apron"], p_priority: 10, p_pages: 1 });
     expect(lines[0]).toContain("inserted: linen apron priority=10");
+    const auth = fetchImpl.calls.find((call) => call.url.includes("/auth/v1/token"));
+    const rpc = fetchImpl.calls.find((call) => call.url.includes("etsy_worker_add_terms"));
+    expect(auth.init.headers.apikey).toBe("publishable-key");
+    expect(auth.init.headers.authorization).toBeUndefined();
+    expect(JSON.parse(auth.init.body)).toMatchObject({ email: "lane@example.test", password: "lane-password" });
+    expect(rpc.init.headers.apikey).toBe("publishable-key");
+    expect(rpc.init.headers.authorization).toBe("Bearer user-access-token");
+    expect(rpc.init.headers.authorization).not.toContain("publishable-key");
 
     const now = [];
     const nowCode = await runWorkerCli(["search-now", "rush term"], env, fetchImpl, {
@@ -167,6 +202,26 @@ describe("runWorkerCli", () => {
     expect(code).toBe(1);
     expect(errors[0]).toContain("ETSY_WORKER_URL");
     expect(errors.join("\n")).not.toContain("publishable-key");
+  });
+
+  it("rejects a secret key before calling the backend", async () => {
+    let fetched = false;
+    const errors = [];
+    const code = await runWorkerCli(["health"], {
+      ...env,
+      ETSY_WORKER_ANON_KEY: `sb_secret_${"a".repeat(24)}`,
+    }, async () => {
+      fetched = true;
+      throw new Error("should not fetch");
+    }, { log: () => {}, error: (line) => errors.push(line) });
+    expect(code).toBe(1);
+    expect(fetched).toBe(false);
+    expect(errors.join("\n")).toMatch(/service_role|sb_secret_/);
+  });
+
+  it("keeps the token cache outside the repository", () => {
+    expect(tokenCachePath({ ETSY_WORKER_TOKEN_CACHE: cache }, process.cwd())).toBe(cache);
+    expect(() => tokenCachePath({ ETSY_WORKER_TOKEN_CACHE: "worker-token.json" }, process.cwd())).toThrow(/outside the repository/);
   });
 });
 

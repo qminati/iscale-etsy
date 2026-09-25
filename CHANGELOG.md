@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.2.1 — Worker review fixes
+
+- Content scripts are classic scripts again. Shared parsers ship as committed
+  IIFE bundles on `globalThis.IscaleEtsy`. The manifest test rejects
+  `content_scripts.type` and top-level `import` / `export`.
+- Block detection fails closed when the content script does not answer, and
+  a search with zero listings and no empty-state marker stops instead of
+  completing.
+- Operator auth replaces anon RPC access. Migration
+  `20260925160000_etsy_worker_auth.sql` grants the public RPCs only to
+  `authenticated` operators. The extension and CLI sign in with email and
+  password, send the publishable or anon key as `apikey`, and send the user
+  access token as the bearer. `service_role` and `sb_secret_` keys are
+  rejected. Content scripts do not receive worker credentials.
+- A lane waits a random 20–60 seconds between jobs and stops claiming past
+  30 jobs in an hour. The poll alarm repeats, so a service-worker restart
+  does not drop the lane. Local runs and worker jobs cannot overlap.
+- Navigation errors fail the job as retryable. Turning worker mode off
+  mid-job releases it without burning an attempt. Transient upload errors
+  retry; batches over 300 rows are split; one bad row is skipped.
+- Total result counts keep the number and the raw text (`1,000+ results`,
+  `Over 50,000 results`). Heartbeats use `workerHeartbeatSeconds`. A saved
+  worker tab is reused only when it is still an etsy.com tab.
+- `npm test` loads the unpacked extension in Chrome for Testing and checks
+  that the content script answers on a static fixture page.
+
 ## 1.2.0 — Worker command channel
 
 - Generalize the optional worker queue into typed jobs: `search`,

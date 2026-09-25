@@ -16,6 +16,15 @@ describe("worker mode wiring", () => {
   it("opens a visible Etsy tab and polls on its own alarm", () => {
     expect(background).toContain('const WORKER_POLL_ALARM = "etsy-worker-poll"');
     expect(background).toContain("if (alarm.name === WORKER_POLL_ALARM) onWorkerAlarm()");
+    expect(background).toContain("periodInMinutes: workerAlarmDelayMinutes(cfg.pollSeconds)");
+    expect(background).not.toMatch(/WORKER_POLL_ALARM,\s*\{\s*delayInMinutes/);
+    expect(background).toContain("if (state.loopAlive || state.launching || state.workerScanning) return false");
+    expect(background).toContain("if (state.workerScanning || state.loopAlive || state.launching) return");
+    expect(background).toContain("cfg.heartbeatSeconds * 1000");
+    expect(background).toContain("validateSavedWorkerTab");
+    expect(background).toContain("workerTabReusable");
+    expect(background).toContain("redactWorkerCredentials(settings)");
+    expect(background).toContain("release: true");
     expect(background).toMatch(/chrome\.tabs\.create\(\{\s*url:\s*"https:\/\/www\.etsy\.com\/",\s*active:\s*true\s*\}\)/);
     expect(background).toContain('action: "worker.typeAndSubmit"');
     expect(background).toContain("runWorkerJob");

@@ -1,9 +1,14 @@
-import { detectSearchBlock } from "./src/core/search-results.js";
-import { parseShopPage } from "./src/core/shop-page.js";
-import { activateSearchSubmit, formatSearchPathLog, planNextPage, clickPlannedNext, typeAndSubmitSearch } from "./src/core/search-box.js";
-
 // Runs on every Etsy page so a worker lane can type into the search box from
-// the homepage, not only from an existing results URL.
+// the homepage, not only from an existing results URL. Classic script: the
+// helpers are loaded first and attached to globalThis.IscaleEtsy.
+
+const detectSearchBlock = globalThis.IscaleEtsy?.detectSearchBlock;
+const parseShopPage = globalThis.IscaleEtsy?.parseShopPage;
+const activateSearchSubmit = globalThis.IscaleEtsy?.activateSearchSubmit;
+const formatSearchPathLog = globalThis.IscaleEtsy?.formatSearchPathLog;
+const planNextPage = globalThis.IscaleEtsy?.planNextPage;
+const clickPlannedNext = globalThis.IscaleEtsy?.clickPlannedNext;
+const typeAndSubmitSearch = globalThis.IscaleEtsy?.typeAndSubmitSearch;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) {

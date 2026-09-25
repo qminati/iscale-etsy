@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectSearchBlock, parseSearchResults, parseTotalResults, mergeSearchResult, searchResultKey, globalRank, MAX_APPEARANCES } from "../src/core/search-results.js";
+import { detectSearchBlock, parseSearchResults, parseTotalResults, parseTotalResultsDetail, mergeSearchResult, searchResultKey, globalRank, MAX_APPEARANCES } from "../src/core/search-results.js";
 
 function setBody(html) {
   document.body.innerHTML = html;
@@ -74,6 +74,7 @@ describe("parseSearchResults", () => {
     `);
     const out = parseSearchResults(doc, "https://www.etsy.com/search?q=linen%20apron");
     expect(out.totalResults).toBe(1248);
+    expect(out.totalResultsRaw).toBe("1,248 results");
     expect(parseTotalResults(doc)).toBe(1248);
     expect(out.results[0]).toMatchObject({
       price: "£18.00",
@@ -88,21 +89,34 @@ describe("parseSearchResults", () => {
   });
 });
 
+describe("parseTotalResultsDetail", () => {
+  it("keeps the number and the raw string for Etsy count formats", () => {
+    expect(parseTotalResultsDetail(setBody("<h1>1,000+ results</h1>"))).toEqual({ count: 1000, raw: "1,000+ results" });
+    expect(parseTotalResultsDetail(setBody("<span>12,345 results</span>"))).toEqual({ count: 12345, raw: "12,345 results" });
+    expect(parseTotalResultsDetail(setBody("<p>Over 50,000 results</p>"))).toEqual({ count: 50000, raw: "Over 50,000 results" });
+  });
+});
+
 describe("detectSearchBlock", () => {
   it("does not treat a normal results page as a block", () => {
     const doc = setBody(`<a href="/listing/5555555555/apron">Apron</a><p>1,248 results</p>`);
-    expect(detectSearchBlock(doc)).toEqual({ blocked: false, reason: null });
+    expect(detectSearchBlock(doc)).toEqual({ blocked: false, reason: null, noResults: false });
   });
 
   it("does not treat an empty search as a captcha", () => {
     const doc = setBody(`<h1>0 results for linen apron</h1><p>We couldn't find any results.</p>`);
-    expect(detectSearchBlock(doc).blocked).toBe(false);
+    expect(detectSearchBlock(doc)).toMatchObject({ blocked: false, noResults: true });
   });
 
   it("stops on a captcha interstitial", () => {
     const doc = setBody(`<title>Just a moment</title><h1>Verify you are a human</h1><iframe src="https://geo.captcha-delivery.com/captcha/"></iframe>`);
     document.title = "Just a moment";
-    expect(detectSearchBlock(doc)).toEqual({ blocked: true, reason: "captcha" });
+    expect(detectSearchBlock(doc)).toEqual({ blocked: true, reason: "captcha", noResults: false });
+  });
+
+  it("treats zero listings without an empty-state marker as suspicious", () => {
+    const doc = setBody(`<h1>Search</h1><p>Please wait</p>`);
+    expect(detectSearchBlock(doc)).toEqual({ blocked: true, reason: "suspicious_empty", noResults: false });
   });
 });
 

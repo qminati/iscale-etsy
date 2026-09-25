@@ -1,6 +1,7 @@
 // PostgREST RPC client for the optional worker backend.
 // The base URL and key are always passed in. This file has no project id.
 
+import { classifyApiKey, workerAuthHeaders } from "./worker-auth.js";
 import { normalizeBackendUrl } from "./worker-config.js";
 
 export const WORKER_RPC = {
@@ -29,31 +30,46 @@ export function rpcUrl(backendUrl, fn) {
   return `${base.base}/rest/v1/rpc/${fn}`;
 }
 
-function redact(text, secret) {
-  const value = String(text ?? "");
-  if (!secret) return value.slice(0, 300);
-  return value.split(secret).join("[redacted]").slice(0, 300);
+function redact(text, secrets) {
+  let value = String(text ?? "");
+  for (const secret of secrets) {
+    if (secret) value = value.split(secret).join("[redacted]");
+  }
+  return value.slice(0, 300);
 }
 
-export function createWorkerClient({ fetchImpl, backendUrl, anonKey } = {}) {
+export function createWorkerClient({ fetchImpl, backendUrl, anonKey, accessToken, getAccessToken } = {}) {
   const fetchFn = fetchImpl || globalThis.fetch;
-  const key = String(anonKey || "");
+  const classified = classifyApiKey(anonKey);
+  if (!classified.ok) throw new Error(classified.error);
+  const key = classified.key;
   if (typeof fetchFn !== "function") throw new Error("missing_fetch");
 
+  async function bearer() {
+    const token = getAccessToken ? await getAccessToken() : accessToken;
+    return workerAuthHeaders(key, token);
+  }
+
   async function rpc(fn, body) {
+    let headers;
+    try {
+      headers = await bearer();
+    } catch (error) {
+      return { ok: false, error: error?.code || error?.message || "missing_access_token" };
+    }
     let response;
     try {
       response = await fetchFn(rpcUrl(backendUrl, fn), {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          apikey: key,
-          authorization: `Bearer ${key}`,
+          apikey: headers.apikey,
+          authorization: headers.authorization,
         },
         body: JSON.stringify(body ?? {}),
       });
     } catch (error) {
-      return { ok: false, error: redact(error?.message || "network_error", key) };
+      return { ok: false, network: true, error: redact(error?.message || "network_error", [key, headers.authorization]) };
     }
     const text = await response.text();
     let data = null;
@@ -64,7 +80,7 @@ export function createWorkerClient({ fetchImpl, backendUrl, anonKey } = {}) {
     }
     if (!response.ok) {
       const message = data?.message || data?.error || data?.hint || `http_${response.status}`;
-      return { ok: false, error: redact(message, key), status: response.status };
+      return { ok: false, error: redact(message, [key, headers.authorization]), status: response.status };
     }
     if (data && typeof data === "object" && !Array.isArray(data)) return data;
     return { ok: true, result: data };
@@ -93,7 +109,7 @@ export function createWorkerClient({ fetchImpl, backendUrl, anonKey } = {}) {
         p_lease_seconds: leaseSeconds,
       });
     },
-    uploadResults({ jobId, laneName, listings, page, totalResults, leaseSeconds }) {
+    uploadResults({ jobId, laneName, listings, page, totalResults, totalResultsRaw, leaseSeconds }) {
       return rpc(WORKER_RPC.uploadResults, {
         p_job_id: jobId,
         p_lane_name: laneName,
@@ -101,6 +117,7 @@ export function createWorkerClient({ fetchImpl, backendUrl, anonKey } = {}) {
         p_page: page,
         p_total_results: totalResults ?? null,
         p_lease_seconds: leaseSeconds,
+        p_total_results_raw: totalResultsRaw ?? null,
       });
     },
     completeJob(jobId, laneName, progress) {
@@ -110,12 +127,14 @@ export function createWorkerClient({ fetchImpl, backendUrl, anonKey } = {}) {
         p_progress: progress || {},
       });
     },
-    failJob(jobId, laneName, error, blocked = false) {
+    failJob(jobId, laneName, error, blocked = false, extra = {}) {
       return rpc(WORKER_RPC.failJob, {
         p_job_id: jobId,
         p_lane_name: laneName,
         p_error: error || "failed",
         p_blocked: blocked === true,
+        p_retryable: extra.retryable === true,
+        p_release: extra.release === true,
       });
     },
     requeueExpired() {

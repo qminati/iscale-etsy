@@ -1,3 +1,4 @@
+import { classifyApiKey } from "./src/core/worker-auth.js";
 import { normalizeWorkerSettings } from "./src/core/worker-config.js";
 
 const els = {
@@ -5,6 +6,8 @@ const els = {
   enabled: document.getElementById("enabled"),
   backendUrl: document.getElementById("backendUrl"),
   anonKey: document.getElementById("anonKey"),
+  email: document.getElementById("email"),
+  password: document.getElementById("password"),
   laneName: document.getElementById("laneName"),
   pollSeconds: document.getElementById("pollSeconds"),
   leaseSeconds: document.getElementById("leaseSeconds"),
@@ -13,6 +16,10 @@ const els = {
   keyMin: document.getElementById("keyMin"),
   keyMax: document.getElementById("keyMax"),
   backoff: document.getElementById("backoff"),
+  betweenMin: document.getElementById("betweenMin"),
+  betweenMax: document.getElementById("betweenMax"),
+  jobsPerHour: document.getElementById("jobsPerHour"),
+  heartbeat: document.getElementById("heartbeat"),
   realtime: document.getElementById("realtime"),
   health: document.getElementById("health"),
   msg: document.getElementById("msg"),
@@ -33,11 +40,19 @@ function show(text, kind) {
   els.msg.className = `msg ${kind || ""}`;
 }
 
+const KEY_ERRORS = {
+  secret_key_rejected: "That is an sb_secret_ key. Paste the publishable or anon key instead.",
+  service_role_rejected: "That is a service_role key. Paste the publishable or anon key instead.",
+  missing_anon_key: "Paste the publishable or anon key.",
+  invalid_api_key: "That key is not a publishable key or an anon JWT.",
+};
+
 function settingsFromForm() {
   return {
     workerEnabled: els.enabled.checked,
     workerBackendUrl: els.backendUrl.value.trim(),
     workerAnonKey: els.anonKey.value.trim(),
+    workerEmail: els.email.value.trim(),
     workerLaneName: els.laneName.value.trim(),
     workerPollSeconds: Number(els.pollSeconds.value),
     workerLeaseSeconds: Number(els.leaseSeconds.value),
@@ -46,6 +61,10 @@ function settingsFromForm() {
     workerKeystrokeMinMs: Number(els.keyMin.value),
     workerKeystrokeMaxMs: Number(els.keyMax.value),
     workerBlockBackoffMin: Number(els.backoff.value),
+    workerBetweenJobsMinMs: Number(els.betweenMin.value) * 1000,
+    workerBetweenJobsMaxMs: Number(els.betweenMax.value) * 1000,
+    workerJobsPerHour: Number(els.jobsPerHour.value),
+    workerHeartbeatSeconds: Number(els.heartbeat.value),
     workerRealtime: els.realtime.checked,
   };
 }
@@ -54,6 +73,8 @@ function fill(settings) {
   els.enabled.checked = settings.workerEnabled === true;
   els.backendUrl.value = settings.workerBackendUrl || "";
   els.anonKey.value = settings.workerAnonKey || "";
+  els.email.value = settings.workerEmail || "";
+  els.password.value = "";
   els.laneName.value = settings.workerLaneName || "";
   els.pollSeconds.value = settings.workerPollSeconds ?? 20;
   els.leaseSeconds.value = settings.workerLeaseSeconds ?? 180;
@@ -62,6 +83,10 @@ function fill(settings) {
   els.keyMin.value = settings.workerKeystrokeMinMs ?? 40;
   els.keyMax.value = settings.workerKeystrokeMaxMs ?? 140;
   els.backoff.value = settings.workerBlockBackoffMin ?? 30;
+  els.betweenMin.value = Math.round((settings.workerBetweenJobsMinMs ?? 20000) / 1000);
+  els.betweenMax.value = Math.round((settings.workerBetweenJobsMaxMs ?? 60000) / 1000);
+  els.jobsPerHour.value = settings.workerJobsPerHour ?? 30;
+  els.heartbeat.value = settings.workerHeartbeatSeconds ?? 30;
   els.realtime.checked = settings.workerRealtime !== false;
 }
 
@@ -76,9 +101,19 @@ async function refreshLane() {
 els.form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const settings = settingsFromForm();
+  const key = classifyApiKey(settings.workerAnonKey);
+  if (settings.workerAnonKey && !key.ok) {
+    show(KEY_ERRORS[key.error] || key.error, "error");
+    return;
+  }
   const cfg = normalizeWorkerSettings(settings);
   if (settings.workerEnabled && !cfg.ready) {
-    show(cfg.configError || "Check the backend URL, key, and lane name.", "error");
+    show(KEY_ERRORS[cfg.configError] || cfg.configError || "Check the backend URL, key, and lane name.", "error");
+    return;
+  }
+  const password = els.password.value;
+  if (settings.workerEnabled && !password && !loadedSignedIn) {
+    show("Enter the lane email and password to sign in.", "error");
     return;
   }
   if (settings.workerEnabled && cfg.hostPermission) {
@@ -92,6 +127,15 @@ els.form.addEventListener("submit", async (event) => {
   if (!saved.ok) {
     show(saved.error || "Could not save.", "error");
     return;
+  }
+  if (password) {
+    const auth = await send("worker.signIn", { email: settings.workerEmail, password });
+    els.password.value = "";
+    if (!auth.ok || auth.result?.ok === false) {
+      show(auth.result?.error || auth.error || "Sign-in failed.", "error");
+      return;
+    }
+    loadedSignedIn = true;
   }
   show(settings.workerEnabled ? "Worker mode is on. Keep this window visible." : "Saved. Worker mode is off.", "ok");
   await refreshLane();
@@ -107,7 +151,11 @@ els.health.addEventListener("click", async () => {
   els.lane.textContent = JSON.stringify(response.result, null, 2);
 });
 
+let loadedSignedIn = false;
 const loaded = await send("settings.get");
-if (loaded.ok) fill(loaded.result || {});
+if (loaded.ok) {
+  fill(loaded.result || {});
+  loadedSignedIn = loaded.result?.workerSignedIn === true;
+}
 await refreshLane();
 setInterval(refreshLane, 2000);

@@ -15,19 +15,38 @@ paste its publishable key into the options page and into your shell.
    (PostgREST plus optional Realtime). Any Postgres that can expose the
    `public.etsy_worker_*` functions over HTTP will also work with the CLI if
    you put a compatible `/rest/v1/rpc` endpoint in `ETSY_WORKER_URL`.
-2. Run both migration files, in order, in the SQL editor or with `psql`:
+2. Run all three migration files, in order, in the SQL editor or with `psql`:
    [supabase/migrations/20260925120000_etsy_worker.sql](../supabase/migrations/20260925120000_etsy_worker.sql),
-   then [supabase/migrations/20260925140000_etsy_worker_commands.sql](../supabase/migrations/20260925140000_etsy_worker_commands.sql).
+   then [supabase/migrations/20260925140000_etsy_worker_commands.sql](../supabase/migrations/20260925140000_etsy_worker_commands.sql),
+   then [supabase/migrations/20260925160000_etsy_worker_auth.sql](../supabase/migrations/20260925160000_etsy_worker_auth.sql).
    Do not commit the project URL or keys. The second file is the command
-   channel (`type`, params, and payload snapshots). Search still works if you
-   only applied the first file; the other job types need the second.
-3. If you are on Supabase, the migration adds `etsy_worker.jobs` to the
+   channel (`type`, params, and payload snapshots). The third file is
+   authorization: it revokes the public RPCs from `anon` and `public`, grants
+   them only to `authenticated`, and requires a row in `etsy_worker.operators`.
+3. If you are on Supabase, the first migration adds `etsy_worker.jobs` to the
    `supabase_realtime` publication when that publication exists. That lets an
    idle lane wake as soon as a term is inserted. Polling still picks the term
    up within about two minutes when Realtime is unavailable.
-4. Copy the project URL (`https://YOUR_PROJECT.supabase.co`) and the anon /
-   publishable key. Treat the anon key as a credential: anyone who has it can
-   add terms and read results.
+4. In Authentication settings, disable public signups. Create one Auth user
+   per lane and one more user for the agents that enqueue work. In the SQL
+   editor, insert an operator row for each user (replace the UUIDs with the
+   ids from Authentication → Users):
+
+   ```sql
+   insert into etsy_worker.operators (user_id, role) values
+     ('<lane-user-uuid>', 'lane'),
+     ('<agent-user-uuid>', 'agent');
+   ```
+
+   `lane` can claim, heartbeat, upload, complete, and fail. `agent` can
+   enqueue, add terms, search now, and read results and health. `admin` can
+   do both. A user with no operator row cannot call the RPCs.
+5. Copy the project URL (`https://YOUR_PROJECT.supabase.co`) and the
+   publishable key (`sb_publishable_...`) or the legacy anon JWT. That value
+   is the `apikey` header only. It is not a bearer token. Do not paste a
+   `service_role` JWT or an `sb_secret_` key into the extension or the CLI;
+   both reject those. The bearer token is the access token from an email and
+   password sign-in.
 
 ## Extension options
 
@@ -38,13 +57,18 @@ On each machine that will scrape:
    browser.
 2. Open the extension options (Worker options on the dashboard, or the
    extension's Options page).
-3. Set the backend URL, anon key, and a lane name unique to that window
-   (`lane-1`, `lane-2`, …).
+3. Set the backend URL, the publishable or anon key, the lane email and
+   password, and a lane name unique to that window (`lane-1`, `lane-2`, …).
+   The password is sent once to sign in and is not stored. The refresh token
+   stays in `chrome.storage.local`. Content scripts cannot read the key or
+   the tokens.
 4. Leave the defaults unless you need to change them: poll 20 seconds, claim
-   lease 180 seconds, 4–9 seconds between results pages, 40–140 ms between
-   keystrokes, 30 minutes of backoff after a captcha. Realtime wake is on.
+   lease 180 seconds, 4–9 seconds between results pages, 20–60 seconds
+   between jobs, 30 jobs per hour, a heartbeat every 30 seconds, 40–140 ms
+   between keystrokes, 30 minutes of backoff after a captcha. Realtime wake
+   is on.
 5. Enable worker mode and save. Chrome asks for permission to call that
-   backend origin. Grant it.
+   backend origin. Grant it. Saving with a password signs that lane user in.
 6. Leave the Chrome window open and visible. The lane focuses that window
    when it starts a search.
 
@@ -122,7 +146,9 @@ page, not the finished scan.
 
 ```bash
 export ETSY_WORKER_URL="https://YOUR_PROJECT.supabase.co"
-export ETSY_WORKER_ANON_KEY="your-publishable-anon-key"
+export ETSY_WORKER_ANON_KEY="your-publishable-or-anon-key"
+export ETSY_WORKER_EMAIL="agent@example.com"
+export ETSY_WORKER_PASSWORD="the-agent-password"
 
 node scripts/etsy-worker.mjs add-terms "linen apron" --priority 10 --pages 2
 node scripts/etsy-worker.mjs search-now "rush term" --pages 1
@@ -136,6 +162,36 @@ node scripts/etsy-worker.mjs results --job "<uuid>" --json
 node scripts/etsy-worker.mjs health
 node scripts/etsy-worker.mjs requeue
 ```
+
+PowerShell:
+
+```powershell
+$env:ETSY_WORKER_URL = "https://YOUR_PROJECT.supabase.co"
+$env:ETSY_WORKER_ANON_KEY = "your-publishable-or-anon-key"
+$env:ETSY_WORKER_EMAIL = "agent@example.com"
+$env:ETSY_WORKER_PASSWORD = "the-agent-password"
+
+node scripts/etsy-worker.mjs add-terms "linen apron" --priority 10 --pages 2
+node scripts/etsy-worker.mjs search-now "rush term" --pages 1
+node scripts/etsy-worker.mjs scrape-listings --url "https://www.etsy.com/listing/1234567890"
+node scripts/etsy-worker.mjs scrape-shop --shop CoolShop --pages 1
+node scripts/etsy-worker.mjs export --source shop --format csv --q "apron" --chip in_carts
+node scripts/etsy-worker.mjs stats
+node scripts/etsy-worker.mjs status --term "linen apron"
+node scripts/etsy-worker.mjs status --shop CoolShop
+node scripts/etsy-worker.mjs results --job "<uuid>" --json
+node scripts/etsy-worker.mjs health
+node scripts/etsy-worker.mjs requeue
+```
+
+`ETSY_WORKER_ANON_KEY` is the publishable key or the legacy anon JWT. The CLI
+sends it as `apikey` and signs in with the email and password
+(`POST /auth/v1/token?grant_type=password`). It refreshes the access token
+before expiry. The refresh token is cached outside the repo at
+`~/.config/iscale-etsy/worker-token.json` (mode `0600`). Override that path
+with `ETSY_WORKER_TOKEN_CACHE` set to an absolute path that is not inside
+this checkout (`$env:ETSY_WORKER_TOKEN_CACHE` in PowerShell). A
+`service_role` JWT or an `sb_secret_` key is rejected before any request.
 
 `enqueue --type <type>` accepts the same flags as the matching command.
 
@@ -156,8 +212,9 @@ raises its priority and page count instead of creating a second open job.
 ## Health and stuck jobs
 
 `health` shows counts by status, how many processing jobs have an expired
-lease, and each lane's last heartbeat. A lane is `stale` when its heartbeat
-is older than 90 seconds.
+lease, and each lane's last heartbeat. A lane appears in that list only after
+its first claim, including an idle claim that finds no job. A lane is `stale`
+when its heartbeat is older than 90 seconds.
 
 A lane that dies mid-search leaves the job `processing` until the lease
 expires (default 180 seconds, renewed while the lane is uploading). The next
@@ -177,27 +234,73 @@ console line is `[etsy-worker] search path: ...`.
 
 ## End-to-end smoke test
 
-This needs a real backend and a visible Chrome window. It is not part of CI.
+The commands below need a real backend and a visible Chrome window. They are
+not part of CI. `npm test` does load the unpacked extension in Chrome for
+Testing (`tests/extension-smoke.test.js`) against a static fixture page and
+checks that the content script answers `worker.detectBlock` and
+`search.scrollAndExtract`. Branded Chrome 137 and later ignores
+`--load-extension`, so that test uses Chrome for Testing.
 
-1. Apply both migrations. Start one lane with worker mode enabled and the
-   window visible. Confirm `node scripts/etsy-worker.mjs health` lists that
-   lane.
+1. Apply all three migrations. Disable public signups, create the lane user
+   and the agent user, and insert their `etsy_worker.operators` rows. In the
+   extension options, set the backend URL, the publishable or anon key, the
+   lane email and password, and the lane name, then enable worker mode and
+   save. That save signs the lane in. Leave the window visible. In the shell,
+   export `ETSY_WORKER_URL`, `ETSY_WORKER_ANON_KEY`, `ETSY_WORKER_EMAIL`, and
+   `ETSY_WORKER_PASSWORD` (PowerShell: `$env:ETSY_WORKER_URL` and the same
+   names). The first CLI command signs the agent in. `health` lists the lane
+   only after that lane's first claim, so confirm the lane with:
+
+   ```bash
+   node scripts/etsy-worker.mjs health
+   ```
+
+   ```powershell
+   node scripts/etsy-worker.mjs health
+   ```
+
 2. Enqueue a small search:
 
    ```bash
    node scripts/etsy-worker.mjs add-terms "linen cross back apron" --priority 50 --pages 1
    ```
 
-3. Within about two minutes on an idle lane, `status --term "linen cross back apron"`
-   shows `state: processing` (then `completed`) and `lane:` set to that
-   window's lane name. The Chrome window comes forward. The service worker
-   log says `search path: search_box` when the search box was used.
-4. `results --term "linen cross back apron" --json` returns `total_results`
-   and a `listings` array. Rows from page 1 are present as soon as that page
-   finishes, before a multi-page job is `completed`.
+   ```powershell
+   node scripts/etsy-worker.mjs add-terms "linen cross back apron" --priority 50 --pages 1
+   ```
+
+3. Within about two minutes on an idle lane, status shows `state: processing`
+   (then `completed`) and `lane:` set to that window's lane name. The Chrome
+   window comes forward. The service worker log says `search path: search_box`
+   when the search box was used.
+
+   ```bash
+   node scripts/etsy-worker.mjs status --term "linen cross back apron"
+   ```
+
+   ```powershell
+   node scripts/etsy-worker.mjs status --term "linen cross back apron"
+   ```
+
+4. Results return `total_results` and a `listings` array. Rows from page 1
+   are present as soon as that page finishes, before a multi-page job is
+   `completed`.
+
+   ```bash
+   node scripts/etsy-worker.mjs results --term "linen cross back apron" --json
+   ```
+
+   ```powershell
+   node scripts/etsy-worker.mjs results --term "linen cross back apron" --json
+   ```
+
 5. Optional immediate pickup while the lane is idle:
 
    ```bash
+   node scripts/etsy-worker.mjs search-now "wool dryer balls" --pages 1
+   ```
+
+   ```powershell
    node scripts/etsy-worker.mjs search-now "wool dryer balls" --pages 1
    ```
 
@@ -209,6 +312,14 @@ This needs a real backend and a visible Chrome window. It is not part of CI.
    node scripts/etsy-worker.mjs stats
    node scripts/etsy-worker.mjs export --source listings --format json
    node scripts/etsy-worker.mjs scrape-shop --shop SomeShopName --pages 1
+   node scripts/etsy-worker.mjs results --job "<uuid>" --json
+   ```
+
+   ```powershell
+   node scripts/etsy-worker.mjs stats
+   node scripts/etsy-worker.mjs export --source listings --format json
+   node scripts/etsy-worker.mjs scrape-shop --shop SomeShopName --pages 1
+   node scripts/etsy-worker.mjs results --job "<uuid>" --json
    ```
 
    `stats` and `export` do not open Etsy. `results --job <id> --json` returns

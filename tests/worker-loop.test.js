@@ -1,6 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { decideWorkerTick, listingRowsForUpload, paceDelayMs, runClaimedSearch } from "../src/core/worker-loop.js";
-import { idlePickupWithinSla } from "../src/core/worker-config.js";
+import {
+  betweenJobsDelayMs,
+  chunkRows,
+  decideWorkerTick,
+  hourlyCapReached,
+  interpretBlockReply,
+  isRetryableUploadFailure,
+  listingRowsForUpload,
+  paceDelayMs,
+  planDrainStep,
+  runClaimedSearch,
+  UPLOAD_BATCH_SIZE,
+  workerTabReusable,
+} from "../src/core/worker-loop.js";
+import { idlePickupWithinSla, normalizeWorkerSettings } from "../src/core/worker-config.js";
 
 function readyCfg(over = {}) {
   return {
@@ -151,6 +164,95 @@ describe("runClaimedSearch", () => {
     const result = await runClaimedSearch({ job: { ...job, pages: 2 }, cfg: readyCfg(), deps: api });
     expect(result.status).toBe("lease_lost");
     expect(api.calls.some((c) => c[0] === "complete")).toBe(false);
+    expect(api.calls.filter((c) => c[0] === "upload")).toHaveLength(1);
+  });
+
+  it("retries a 503 upload and then completes", async () => {
+    let tries = 0;
+    const sleeps = [];
+    const api = deps({
+      typeAndSubmit: async () => ({ ok: true, path: "search_box", method: "button" }),
+      waitForSearch: async () => "https://www.etsy.com/search?q=linen+apron",
+      extractPage: async () => page(1),
+      upload: async () => {
+        tries += 1;
+        if (tries < 3) return { ok: false, status: 503, error: "http_503" };
+        return { ok: true, listings_uploaded: 1 };
+      },
+      complete: async () => ({ ok: true }),
+    });
+    api.sleep = async (ms) => {
+      sleeps.push(ms);
+    };
+    const result = await runClaimedSearch({ job: { ...job, pages: 1 }, cfg: readyCfg(), deps: api });
+    expect(result.status).toBe("completed");
+    expect(tries).toBe(3);
+    expect(sleeps).toEqual([500, 1000]);
+    expect(api.calls.some((c) => c[0] === "fail")).toBe(false);
+  });
+
+  it("splits more than 300 rows into multiple uploads", async () => {
+    const results = Array.from({ length: UPLOAD_BATCH_SIZE + 1 }, (_, index) => ({
+      listingId: String(1000000000 + index),
+      title: "Apron",
+      price: "$20.00",
+      priceNumeric: 20,
+      currency: "USD",
+      shopName: "Shop",
+      position: index + 1,
+      page: 1,
+      url: `https://www.etsy.com/listing/${1000000000 + index}`,
+    }));
+    const batches = [];
+    const api = deps({
+      typeAndSubmit: async () => ({ ok: true, path: "search_box", method: "button" }),
+      waitForSearch: async () => "https://www.etsy.com/search?q=linen+apron",
+      extractPage: async () => ({
+        payload: { keyword: "linen apron", page: 1, totalResults: 50000, totalResultsRaw: "Over 50,000 results", results },
+        block: { blocked: false, reason: null, noResults: false },
+      }),
+      upload: async (body) => {
+        batches.push(body.listings.length);
+        return { ok: true, listings_uploaded: body.listings.length };
+      },
+      complete: async () => ({ ok: true }),
+    });
+    const result = await runClaimedSearch({ job: { ...job, pages: 1 }, cfg: readyCfg(), deps: api });
+    expect(result.status).toBe("completed");
+    expect(batches).toEqual([UPLOAD_BATCH_SIZE, 1]);
+    expect(api.calls.find((c) => c[0] === "upload")[1].totalResultsRaw).toBe("Over 50,000 results");
+  });
+
+  it("stops a search with zero listings and no empty-state marker", async () => {
+    const api = deps({
+      typeAndSubmit: async () => ({ ok: true, path: "search_box", method: "button" }),
+      waitForSearch: async () => "https://www.etsy.com/search?q=linen+apron",
+      extractPage: async () => ({
+        payload: { results: [], totalResults: null, noResults: false },
+        block: { blocked: false, reason: null, noResults: false },
+      }),
+      fail: async () => ({ ok: true, status: "blocked" }),
+    });
+    const result = await runClaimedSearch({ job: { ...job, pages: 1 }, cfg: readyCfg(), deps: api });
+    expect(result).toMatchObject({ status: "blocked", reason: "suspicious_empty" });
+    expect(api.calls.some((c) => c[0] === "upload" || c[0] === "complete")).toBe(false);
+    expect(api.calls.find((c) => c[0] === "fail")[1]).toMatchObject({ blocked: true, error: "suspicious_empty:page:1" });
+  });
+
+  it("completes a recognizable empty search", async () => {
+    const api = deps({
+      typeAndSubmit: async () => ({ ok: true, path: "search_box", method: "button" }),
+      waitForSearch: async () => "https://www.etsy.com/search?q=linen+apron",
+      extractPage: async () => ({
+        payload: { results: [], totalResults: 0, totalResultsRaw: "0 results", noResults: true },
+        block: { blocked: false, reason: null, noResults: true },
+      }),
+      upload: async () => ({ ok: true, listings_uploaded: 0 }),
+      complete: async () => ({ ok: true }),
+    });
+    const result = await runClaimedSearch({ job: { ...job, pages: 1 }, cfg: readyCfg(), deps: api });
+    expect(result.status).toBe("completed");
+    expect(api.calls.some((c) => c[0] === "fail")).toBe(false);
   });
 });
 
@@ -184,5 +286,47 @@ describe("listing rows and pace", () => {
     expect(idlePickupWithinSla(20)).toBe(true);
     expect(idlePickupWithinSla(120)).toBe(true);
     expect(idlePickupWithinSla(121, 0)).toBe(false);
+  });
+
+  it("pauses after the first job and stops at the hourly cap", () => {
+    const cfg = { betweenJobsMinMs: 20000, betweenJobsMaxMs: 60000 };
+    expect(planDrainStep({ ranJob: false, cfg, rand: () => 0 })).toEqual({ action: "claim" });
+    expect(planDrainStep({ ranJob: true, cfg, rand: () => 0 })).toEqual({ action: "pause", delayMs: 20000 });
+    expect(betweenJobsDelayMs(cfg, () => 0)).toBe(20000);
+    expect(betweenJobsDelayMs(cfg, () => 0.999999)).toBe(60000);
+    const now = 1_000_000;
+    const times = Array.from({ length: 30 }, (_, index) => now - index * 1000);
+    expect(hourlyCapReached(times, now, 30)).toBe(true);
+    expect(planDrainStep({ ranJob: false, claimTimes: times, nowMs: now, cap: 30 }).action).toBe("hourly_cap");
+    expect(chunkRows(Array.from({ length: 301 }, (_, index) => index)).map((part) => part.length)).toEqual([300, 1]);
+    expect(isRetryableUploadFailure({ ok: false, status: 503 })).toBe(true);
+    expect(isRetryableUploadFailure({ ok: false, network: true })).toBe(true);
+    expect(isRetryableUploadFailure({ ok: false, error: "lease_lost" })).toBe(false);
+    expect(isRetryableUploadFailure({ ok: false, status: 400 })).toBe(false);
+  });
+
+  it("treats a missing block reply as blocked and only reuses an etsy tab", () => {
+    expect(interpretBlockReply(null)).toMatchObject({ blocked: true, reason: "unknown" });
+    expect(interpretBlockReply({ error: "no_content_script" })).toMatchObject({ blocked: true, reason: "unknown" });
+    expect(interpretBlockReply({ block: { blocked: false, noResults: true } })).toEqual({
+      blocked: false,
+      reason: null,
+      noResults: true,
+    });
+    expect(workerTabReusable({ id: 4, url: "https://www.etsy.com/search?q=apron" }, 9)).toBe(true);
+    expect(workerTabReusable({ id: 4, pendingUrl: "https://www.etsy.com/" }, null)).toBe(true);
+    expect(workerTabReusable({ id: 4, url: "https://www.etsy.com/" }, 4)).toBe(false);
+    expect(workerTabReusable({ id: 4, url: "https://evil.example/" }, null)).toBe(false);
+    expect(workerTabReusable({ id: 4, url: "http://www.etsy.com/" }, null)).toBe(false);
+    const cfg = normalizeWorkerSettings({
+      workerEnabled: true,
+      workerBackendUrl: "https://example.test",
+      workerAnonKey: "k",
+      workerLaneName: "lane-1",
+    });
+    expect(cfg.betweenJobsMinMs).toBe(20000);
+    expect(cfg.betweenJobsMaxMs).toBe(60000);
+    expect(cfg.jobsPerHour).toBe(30);
+    expect(cfg.heartbeatSeconds).toBe(30);
   });
 });

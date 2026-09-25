@@ -30,6 +30,7 @@ function harness(overrides = {}) {
       heartbeat: note("heartbeat"),
       complete: note("complete"),
       fail: note("fail"),
+      release: note("release"),
       buildExport: note("buildExport"),
       readStats: note("readStats"),
     },
@@ -169,6 +170,59 @@ describe("worker command executors", () => {
     expect(exported.status).toBe("completed");
     expect(api.calls).not.toContain("navigate");
     expect(JOB_TYPES).toContain("collection-stats");
+  });
+
+  it("reports a navigation throw as a retryable failure", async () => {
+    const fails = [];
+    const api = harness({
+      navigate: async () => {
+        throw new Error("tab closed");
+      },
+      fail: async (info) => {
+        fails.push(info);
+        return { ok: true };
+      },
+    });
+    const result = await runWorkerJob({
+      job: {
+        id: "job-nav",
+        type: "scrape-listings",
+        params: { urls: ["https://www.etsy.com/listing/1234567890/blue-mug"] },
+      },
+      cfg: cfg(),
+      deps: api.deps,
+    });
+    expect(result).toMatchObject({ status: "failed", error: "tab closed", retryable: true });
+    expect(fails[0]).toMatchObject({ blocked: false, error: "tab closed", retryable: true });
+    expect(api.calls).not.toContain("release");
+  });
+
+  it("releases a job without failing it when worker mode turns off mid-navigation", async () => {
+    let cancelled = false;
+    const released = [];
+    const api = harness({
+      navigate: async () => {
+        cancelled = true;
+        throw new Error("stopped");
+      },
+      release: async (info) => {
+        released.push(info);
+        return { ok: true };
+      },
+    });
+    api.deps.isCancelled = () => cancelled;
+    const result = await runWorkerJob({
+      job: {
+        id: "job-stop",
+        type: "scrape-listings",
+        params: { urls: ["https://www.etsy.com/listing/1234567890/blue-mug"] },
+      },
+      cfg: cfg(),
+      deps: api.deps,
+    });
+    expect(result.status).toBe("released");
+    expect(released[0]).toMatchObject({ jobId: "job-stop" });
+    expect(api.calls).not.toContain("fail");
   });
 
   it("fails an unknown job type instead of leaving it claimed", async () => {

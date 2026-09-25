@@ -24,7 +24,17 @@ describe("public tree", () => {
       if (/https:\/\/[a-z0-9]{15,}\.supabase\.co/i.test(text)) offenders.push(path);
       if (/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/.test(text)) offenders.push(path);
       if (/service_role['"]?\s*[:=]\s*['"][^'"]+['"]/.test(text)) offenders.push(path);
+      if (/sb_secret_[A-Za-z0-9_-]{16,}/.test(text)) offenders.push(path);
+      if (/sb_publishable_[A-Za-z0-9_-]{16,}/.test(text)) offenders.push(path);
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("matches real-looking secret and publishable keys", () => {
+    const secret = `sb_secret_${"a".repeat(20)}`;
+    const publishable = `sb_publishable_${"b".repeat(20)}`;
+    expect(/sb_secret_[A-Za-z0-9_-]{16,}/.test(secret)).toBe(true);
+    expect(/sb_publishable_[A-Za-z0-9_-]{16,}/.test(publishable)).toBe(true);
+    expect(/sb_publishable_[A-Za-z0-9_-]{16,}/.test("sb_publishable_...")).toBe(false);
   });
 });

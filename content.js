@@ -1,7 +1,12 @@
-import { detectSearchBlock, parseSearchResults } from "./src/core/search-results.js";
-
 (function () {
   "use strict";
+
+  const parseSearchResults = globalThis.IscaleEtsy?.parseSearchResults;
+  const detectSearchBlock = globalThis.IscaleEtsy?.detectSearchBlock;
+  if (!parseSearchResults || !detectSearchBlock) {
+    console.error("iScale Etsy search helpers did not load");
+    return;
+  }
 
   if (window.__etsyResearchSearchRan) return;
   window.__etsyResearchSearchRan = true;

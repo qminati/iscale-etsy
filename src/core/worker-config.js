@@ -2,6 +2,8 @@
 // Worker mode is off until a person turns it on and supplies their own backend.
 // Nothing here is a URL, key, or lane name.
 
+import { classifyApiKey } from "./worker-auth.js";
+
 export const LANE_SESSION_KEY = "etsyWorkerLane";
 
 export const WORKER_DEFAULTS = {
@@ -17,6 +19,10 @@ export const WORKER_DEFAULTS = {
   workerKeystrokeMinMs: 40,
   workerKeystrokeMaxMs: 140,
   workerBlockBackoffMin: 30,
+  workerBetweenJobsMinMs: 20000,
+  workerBetweenJobsMaxMs: 60000,
+  workerJobsPerHour: 30,
+  workerEmail: "",
   workerRealtime: true,
   workerBlockedUntil: 0,
 };
@@ -64,19 +70,26 @@ export function normalizeWorkerSettings(settings = {}) {
   const backend = normalizeBackendUrl(merged.workerBackendUrl);
   const lane = normalizeLaneName(merged.workerLaneName);
   const enabled = merged.workerEnabled === true;
-  const anonKey = String(merged.workerAnonKey || "").trim();
+  const keyCheck = classifyApiKey(merged.workerAnonKey);
+  const anonKey = keyCheck.ok ? keyCheck.key : "";
   const paceMinMs = clampInt(merged.workerPaceMinMs, 500, 120000, WORKER_DEFAULTS.workerPaceMinMs);
+  const betweenJobsMinMs = clampInt(merged.workerBetweenJobsMinMs, 0, 600000, WORKER_DEFAULTS.workerBetweenJobsMinMs);
+  const betweenJobsMaxMs = Math.max(
+    betweenJobsMinMs,
+    clampInt(merged.workerBetweenJobsMaxMs, 0, 600000, WORKER_DEFAULTS.workerBetweenJobsMaxMs),
+  );
   const paceMaxMs = Math.max(paceMinMs, clampInt(merged.workerPaceMaxMs, 500, 120000, WORKER_DEFAULTS.workerPaceMaxMs));
   const keystrokeMinMs = clampInt(merged.workerKeystrokeMinMs, 10, 1000, WORKER_DEFAULTS.workerKeystrokeMinMs);
   const keystrokeMaxMs = Math.max(
     keystrokeMinMs,
     clampInt(merged.workerKeystrokeMaxMs, 10, 2000, WORKER_DEFAULTS.workerKeystrokeMaxMs),
   );
-  const ready = enabled && backend.ok && lane.ok && anonKey.length > 0;
+  const email = String(merged.workerEmail || "").trim();
+  const ready = enabled && backend.ok && lane.ok && keyCheck.ok;
   let configError = null;
   if (enabled && !ready) {
     if (!backend.ok) configError = backend.error;
-    else if (!anonKey) configError = "missing_anon_key";
+    else if (!keyCheck.ok) configError = keyCheck.error;
     else configError = lane.error;
   }
   return {
@@ -87,6 +100,8 @@ export function normalizeWorkerSettings(settings = {}) {
     origin: backend.ok ? backend.origin : "",
     hostPermission: backend.ok ? backend.hostPermission : "",
     anonKey,
+    keyKind: keyCheck.ok ? keyCheck.kind : "",
+    email,
     laneName: lane.ok ? lane.laneName : "",
     leaseSeconds: clampInt(merged.workerLeaseSeconds, 30, 3600, WORKER_DEFAULTS.workerLeaseSeconds),
     pollSeconds: clampInt(merged.workerPollSeconds, 5, 120, WORKER_DEFAULTS.workerPollSeconds),
@@ -96,6 +111,9 @@ export function normalizeWorkerSettings(settings = {}) {
     keystrokeMinMs,
     keystrokeMaxMs,
     blockBackoffMin: clampInt(merged.workerBlockBackoffMin, 1, 240, WORKER_DEFAULTS.workerBlockBackoffMin),
+    betweenJobsMinMs,
+    betweenJobsMaxMs,
+    jobsPerHour: clampInt(merged.workerJobsPerHour, 1, 500, WORKER_DEFAULTS.workerJobsPerHour),
     realtime: merged.workerRealtime !== false,
     blockedUntil: Number(merged.workerBlockedUntil) || 0,
   };
@@ -122,11 +140,29 @@ const SNAPSHOT_KEYS = [
   "pages",
   "listingsUploaded",
   "totalResults",
+  "totalResultsRaw",
   "searchPath",
   "lastError",
   "updatedAt",
   "backendHost",
 ];
+
+const WORKER_SECRET_KEYS = [
+  "workerAnonKey",
+  "workerPassword",
+  "workerAccessToken",
+  "workerRefreshToken",
+];
+
+// Content scripts may read settings for browsing preferences. They must not
+// receive the backend key, password, or auth tokens.
+export function redactWorkerCredentials(settings) {
+  const copy = { ...(settings || {}) };
+  for (const key of Object.keys(copy)) {
+    if (key.startsWith("worker") || WORKER_SECRET_KEYS.includes(key)) delete copy[key];
+  }
+  return copy;
+}
 
 export function sanitizeLaneSnapshot(partial) {
   const src = partial && typeof partial === "object" ? partial : {};

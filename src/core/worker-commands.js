@@ -8,7 +8,7 @@ import { canonicalListingUrl } from "./etsy-url.js";
 import { SEARCH_EXPORT_COLUMNS } from "./search-results.js";
 import { SHOP_CHIPS, SHOP_SORTS, queryShop } from "./shop-sort.js";
 import { buildShopUrl } from "./shop-page.js";
-import { listingRowsForUpload, paceDelayMs, runClaimedSearch } from "./worker-loop.js";
+import { deliverListings, isRetryableUploadFailure, listingRowsForUpload, paceDelayMs, runClaimedSearch, uploadWithBackoff } from "./worker-loop.js";
 
 export const JOB_TYPES = ["search", "scrape-listings", "scrape-shop", "export", "collection-stats"];
 export const MAX_LISTING_URLS = 40;
@@ -192,26 +192,22 @@ function snapshot(cfg, extra) {
 }
 
 async function uploadWithRetry(deps, body) {
-  let uploaded = await deps.upload?.(body);
-  if (!uploaded?.ok && uploaded?.error !== "lease_lost" && uploaded?.error !== "already_completed") {
-    uploaded = await deps.upload?.(body);
-  }
-  return uploaded || { ok: false, error: "upload_failed" };
+  return deliverListings(deps, body);
 }
 
 async function uploadPayloadWithRetry(deps, body) {
-  let uploaded = await deps.uploadPayload?.(body);
-  if (!uploaded?.ok && uploaded?.error !== "lease_lost" && uploaded?.error !== "already_completed") {
-    uploaded = await deps.uploadPayload?.(body);
-  }
-  return uploaded || { ok: false, error: "upload_failed" };
+  return uploadWithBackoff((part) => deps.uploadPayload?.(part), body, { sleep: deps.sleep });
 }
 
 function classifyUpload(uploaded, listingsUploaded) {
   if (uploaded?.ok) return { ok: true, listingsUploaded: uploaded.listings_uploaded ?? listingsUploaded };
   if (uploaded?.error === "already_completed") return { done: true, listingsUploaded };
   if (uploaded?.error === "lease_lost") return { leaseLost: true, listingsUploaded };
-  return { error: uploaded?.error || "upload_failed", listingsUploaded };
+  return {
+    error: uploaded?.error || "upload_failed",
+    listingsUploaded,
+    retryable: isRetryableUploadFailure(uploaded),
+  };
 }
 
 async function finishBlocked(deps, cfg, job, block, page, listingsUploaded) {
@@ -243,7 +239,7 @@ async function finishUploadProblem(deps, cfg, job, outcome, page) {
     }));
     return { status: "lease_lost", page, listingsUploaded: outcome.listingsUploaded };
   }
-  await deps.fail?.({ jobId: job.id, blocked: false, error: outcome.error });
+  await deps.fail?.({ jobId: job.id, blocked: false, error: outcome.error, retryable: outcome.retryable === true });
   await deps.writeSession?.(snapshot(cfg, {
     status: "error",
     phase: "upload",
@@ -481,7 +477,7 @@ export function runStatsCommand({ job, cfg, deps }) {
   });
 }
 
-export async function runWorkerJob({ job, cfg, deps }) {
+async function dispatchWorkerJob({ job, cfg, deps }) {
   const type = jobTypeOf(job);
   if (type === "search") return runClaimedSearch({ job, cfg, deps });
   if (type === "scrape-listings") return runScrapeListings({ job, cfg, deps });
@@ -490,4 +486,44 @@ export async function runWorkerJob({ job, cfg, deps }) {
   if (type === "collection-stats") return runStatsCommand({ job, cfg, deps });
   await deps.fail?.({ jobId: job?.id, blocked: false, error: `unknown_job_type:${type}` });
   return { status: "failed", error: "unknown_job_type" };
+}
+
+export async function runWorkerJob({ job, cfg, deps }) {
+  try {
+    const result = await dispatchWorkerJob({ job, cfg, deps });
+    if (result?.status === "cancelled") {
+      await deps.release?.({ jobId: job?.id });
+      await deps.writeSession?.(snapshot(cfg, {
+        status: "idle",
+        phase: "released",
+        jobId: job?.id,
+        term: job?.term,
+        lastError: "",
+      }));
+      return { ...result, status: "released" };
+    }
+    return result;
+  } catch (error) {
+    const message = String(error?.message || error || "navigation_failed").slice(0, 300);
+    if (deps.isCancelled?.()) {
+      await deps.release?.({ jobId: job?.id, error: message });
+      await deps.writeSession?.(snapshot(cfg, {
+        status: "idle",
+        phase: "released",
+        jobId: job?.id,
+        term: job?.term,
+        lastError: "",
+      }));
+      return { status: "released", error: message };
+    }
+    await deps.fail?.({ jobId: job?.id, blocked: false, error: message, retryable: true });
+    await deps.writeSession?.(snapshot(cfg, {
+      status: "error",
+      phase: "navigation",
+      jobId: job?.id,
+      term: job?.term,
+      lastError: message,
+    }));
+    return { status: "failed", error: message, retryable: true };
+  }
 }

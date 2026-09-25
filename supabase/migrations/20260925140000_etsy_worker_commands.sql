@@ -397,8 +397,6 @@ begin
 end;
 $fn$;
 
-drop function if exists etsy_worker.pick_job(text) cascade;
-
 create or replace function etsy_worker.pick_job(p_term text)
 returns etsy_worker.jobs
 language plpgsql

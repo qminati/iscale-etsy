@@ -4,31 +4,36 @@
 
 import { normalizeBackendUrl } from "./worker-config.js";
 
-export function realtimeWebSocketUrl(backendUrl, anonKey) {
+export function realtimeWebSocketUrl(backendUrl, apiKey) {
   const base = normalizeBackendUrl(backendUrl);
   if (!base.ok) throw new Error(base.error);
   const url = new URL(base.origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = "/realtime/v1/websocket";
-  url.searchParams.set("apikey", String(anonKey || ""));
+  url.searchParams.set("apikey", String(apiKey || ""));
   url.searchParams.set("vsn", "1.0.0");
   return url.toString();
 }
 
-export function realtimeJoinMessage(ref = "1") {
+export function realtimeJoinMessage(ref = "1", accessToken = "") {
+  const payload = {
+    config: {
+      broadcast: { ack: false, self: false },
+      presence: { enabled: false },
+      postgres_changes: [
+        { event: "INSERT", schema: "etsy_worker", table: "jobs" },
+        { event: "UPDATE", schema: "etsy_worker", table: "jobs" },
+      ],
+    },
+  };
+  const token = String(accessToken || "");
+  if (token && !token.startsWith("sb_publishable_") && !token.startsWith("sb_secret_")) {
+    payload.access_token = token;
+  }
   return {
     topic: "realtime:etsy_worker:jobs",
     event: "phx_join",
-    payload: {
-      config: {
-        broadcast: { ack: false, self: false },
-        presence: { enabled: false },
-        postgres_changes: [
-          { event: "INSERT", schema: "etsy_worker", table: "jobs" },
-          { event: "UPDATE", schema: "etsy_worker", table: "jobs" },
-        ],
-      },
-    },
+    payload,
     ref: String(ref),
   };
 }

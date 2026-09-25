@@ -20,6 +20,109 @@ export function paceDelayMs(cfg = {}, rand = Math.random) {
   return min + Math.floor(rand() * (max - min + 1));
 }
 
+export function betweenJobsDelayMs(cfg = {}, rand = Math.random) {
+  const min = Math.max(0, Number(cfg.betweenJobsMinMs) || 0);
+  const max = Math.max(min, Number(cfg.betweenJobsMaxMs) || min);
+  return min + Math.floor(rand() * (max - min + 1));
+}
+
+export const HOUR_MS = 60 * 60 * 1000;
+export const UPLOAD_BATCH_SIZE = 300;
+
+export function jobsWithinHour(timestamps, nowMs, windowMs = HOUR_MS) {
+  const now = Number(nowMs) || 0;
+  return (Array.isArray(timestamps) ? timestamps : []).filter((stamp) => {
+    const at = Number(stamp);
+    return Number.isFinite(at) && now - at < windowMs && now - at >= 0;
+  });
+}
+
+export function hourlyCapReached(timestamps, nowMs, cap, windowMs = HOUR_MS) {
+  const limit = Number(cap);
+  if (!Number.isFinite(limit) || limit <= 0) return false;
+  return jobsWithinHour(timestamps, nowMs, windowMs).length >= limit;
+}
+
+export function planDrainStep({ ranJob = false, claimTimes = [], nowMs = Date.now(), cap = 30, cfg = {}, rand = Math.random } = {}) {
+  if (hourlyCapReached(claimTimes, nowMs, cap)) return { action: "hourly_cap" };
+  if (ranJob) return { action: "pause", delayMs: betweenJobsDelayMs(cfg, rand) };
+  return { action: "claim" };
+}
+
+export function chunkRows(rows, size = UPLOAD_BATCH_SIZE) {
+  const list = Array.isArray(rows) ? rows : [];
+  const limit = Math.max(1, Number(size) || UPLOAD_BATCH_SIZE);
+  if (list.length === 0) return [[]];
+  const chunks = [];
+  for (let i = 0; i < list.length; i += limit) chunks.push(list.slice(i, i + limit));
+  return chunks;
+}
+
+export function isRetryableUploadFailure(result) {
+  if (!result || result.ok) return false;
+  if (result.network === true) return true;
+  const status = Number(result.status);
+  if (status === 408 || status === 429) return true;
+  return status >= 500 && status <= 599;
+}
+
+export async function uploadWithBackoff(send, body, { sleep = async () => {}, attempts = 4 } = {}) {
+  let last = null;
+  const tries = Math.max(1, Number(attempts) || 1);
+  for (let i = 0; i < tries; i += 1) {
+    try {
+      last = await send(body);
+    } catch (error) {
+      last = { ok: false, network: true, error: String(error?.message || error || "network_error") };
+    }
+    if (last?.ok || !isRetryableUploadFailure(last)) return last || { ok: false, error: "upload_failed" };
+    if (i < tries - 1) await sleep(Math.min(8000, 500 * 2 ** i));
+  }
+  return last || { ok: false, error: "upload_failed" };
+}
+
+export async function deliverListings(deps, body) {
+  const { listings, ...rest } = body || {};
+  const chunks = chunkRows(listings);
+  let last = null;
+  for (const chunk of chunks) {
+    last = await uploadWithBackoff((part) => deps.upload(part), { ...rest, listings: chunk }, { sleep: deps.sleep });
+    if (!last?.ok) return last;
+  }
+  return last || { ok: false, error: "upload_failed" };
+}
+
+export function interpretBlockReply(response) {
+  if (!response || response.error || !response.block || typeof response.block.blocked !== "boolean") {
+    return { blocked: true, reason: "unknown", noResults: false };
+  }
+  return {
+    blocked: response.block.blocked === true,
+    reason: response.block.reason || null,
+    noResults: response.block.noResults === true,
+  };
+}
+
+export function workerTabReusable(tab, localRunnerTabId) {
+  if (!tab || tab.id == null) return false;
+  if (localRunnerTabId != null && tab.id === localRunnerTabId) return false;
+  const url = tab.url || tab.pendingUrl || "";
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && /(^|\.)etsy\.com$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function suspiciousEmptySearch(extracted) {
+  if (extracted?.block?.blocked) return false;
+  const results = extracted?.payload?.results || [];
+  if (results.length > 0) return false;
+  if (extracted?.block?.noResults === true || extracted?.payload?.noResults === true) return false;
+  return true;
+}
+
 export function listingRowsForUpload(payload) {
   const scrapedAt = payload?.capturedAt || new Date().toISOString();
   return (payload?.results || [])
@@ -64,6 +167,7 @@ export async function runClaimedSearch({ job, cfg, deps }) {
   const sort = job?.sort || "most_relevant";
   const term = job?.term;
   let totalResults = null;
+  let totalResultsRaw = null;
   let listingsUploaded = 0;
   let searchPath = "";
 
@@ -153,8 +257,8 @@ export async function runClaimedSearch({ job, cfg, deps }) {
     if (!extracted?.payload && !extracted?.block?.blocked) {
       extracted = await deps.extractPage();
     }
-    if (extracted?.block?.blocked) {
-      const reason = extracted.block.reason || "captcha";
+    if (extracted?.block?.blocked || suspiciousEmptySearch(extracted)) {
+      const reason = extracted?.block?.blocked ? extracted.block.reason || "captcha" : "suspicious_empty";
       await deps.fail?.({ jobId: job.id, blocked: true, error: `${reason}:page:${page}` });
       await deps.writeSession?.(snapshot(sessionBase, {
         status: "blocked",
@@ -173,6 +277,7 @@ export async function runClaimedSearch({ job, cfg, deps }) {
 
     const payload = extracted?.payload || { results: [], totalResults: null };
     if (payload.totalResults != null) totalResults = payload.totalResults;
+    if (payload.totalResultsRaw) totalResultsRaw = payload.totalResultsRaw;
     const listings = listingRowsForUpload(payload);
     await deps.writeSession?.(snapshot(sessionBase, {
       status: "uploading",
@@ -186,22 +291,14 @@ export async function runClaimedSearch({ job, cfg, deps }) {
       listingsUploaded,
     }));
 
-    let uploaded = await deps.upload({
+    const uploaded = await deliverListings(deps, {
       jobId: job.id,
       page,
       listings,
       totalResults,
+      totalResultsRaw,
       searchPath,
     });
-    if (!uploaded?.ok && uploaded?.error !== "lease_lost" && uploaded?.error !== "already_completed") {
-      uploaded = await deps.upload({
-        jobId: job.id,
-        page,
-        listings,
-        totalResults,
-        searchPath,
-      });
-    }
     if (!uploaded?.ok) {
       if (uploaded?.error === "already_completed") {
         return { status: "completed", already: true, page, listingsUploaded, totalResults };
@@ -218,7 +315,7 @@ export async function runClaimedSearch({ job, cfg, deps }) {
         }));
         return { status: "lease_lost", page, listingsUploaded, totalResults };
       }
-      await deps.fail?.({ jobId: job.id, blocked: false, error });
+      await deps.fail?.({ jobId: job.id, blocked: false, error, retryable: isRetryableUploadFailure(uploaded) });
       await deps.writeSession?.(snapshot(sessionBase, {
         status: "error",
         phase: "upload",
